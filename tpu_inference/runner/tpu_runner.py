@@ -505,7 +505,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
                     runner=self._runner,
                     scheduler_output=self._scheduler_output,
                     expert_indices_cpu=np.asarray(
-                        jax.device_get(self._expert_indices)),
+                        common_utils.safe_device_get(self._expert_indices)),
                     req_ids=self._model_runner_output.req_ids,
                     sampled_token_ids=valid_sampled_token_ids,
                     req_ids_dp=self._req_ids_dp,
@@ -2504,7 +2504,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     runner=self,
                     scheduler_output=scheduler_output,
                     expert_indices_cpu=np.asarray(
-                        jax.device_get(expert_indices)),
+                        common_utils.safe_device_get(expert_indices)),
                     req_ids=req_ids,
                     sampled_token_ids=valid_sampled_token_ids,
                     req_ids_dp=req_ids_dp,
