@@ -1589,7 +1589,9 @@ class CompilationManager:
         # ForbidCompile guard inside `Eagle3Proposer.propose` raises. None for
         # pure-attention models (the common eagle3 case) so the field stays
         # absent end-to-end.
-        if self.runner.kv_cache_config.has_mamba_layers:
+        if self.runner.kv_cache_config.has_mamba_layers and (
+                getattr(self.runner.cache_config, "mamba_cache_mode", "none")
+                != "align" or uses_gdn_spec_scratch(self.runner.vllm_config)):
             eagle3_mamba_state_indices = device_array(
                 self.runner.mesh,
                 np.zeros(self.runner.max_num_reqs, dtype=np.int32),
@@ -1602,6 +1604,9 @@ class CompilationManager:
                                                 sharding=dp_sharding)
         last_token_indices = self._create_dummy_tensor(
             (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+        num_spec_tokens = (
+            self.runner.speculative_config.num_speculative_tokens
+            if self.runner.speculative_config else 0)
         for num_tokens in self.runner.num_tokens_paddings:
             for num_reqs in self.runner.attn_num_reqs_paddings:
                 positions = self._create_dummy_tensor((num_tokens, ),
@@ -1614,6 +1619,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=eagle3_mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    num_spec_tokens=num_spec_tokens,
                 )
 
                 def drafter_propose_warmup(_fn, _args, _call_kwargs):
@@ -1724,7 +1730,9 @@ class CompilationManager:
         # ForbidCompile guard inside `Eagle3Proposer.propose` raises. None for
         # pure-attention models (the common eagle3 case) so the field stays
         # absent end-to-end.
-        if self.runner.kv_cache_config.has_mamba_layers:
+        if self.runner.kv_cache_config.has_mamba_layers and (
+                getattr(self.runner.cache_config, "mamba_cache_mode", "none")
+                != "align" or uses_gdn_spec_scratch(self.runner.vllm_config)):
             mamba_state_indices = device_array(self.runner.mesh,
                                                np.zeros(
                                                    self.runner.max_num_reqs,
@@ -1733,6 +1741,9 @@ class CompilationManager:
         else:
             mamba_state_indices = None
 
+        num_spec_tokens = (
+            self.runner.speculative_config.num_speculative_tokens
+            if self.runner.speculative_config else 0)
         num_reqs_dp = self._create_dummy_tensor((dp_size, ),
                                                 jnp.int32,
                                                 sharding=dp_sharding)
@@ -1758,6 +1769,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    num_spec_tokens=num_spec_tokens,
                 )
 
                 def drafter_propose_warmup(_fn, _args, _call_kwargs):

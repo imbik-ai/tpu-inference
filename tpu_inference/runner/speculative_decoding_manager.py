@@ -259,14 +259,13 @@ class SpeculativeDecodingManager:
                     attn_metadata = next(iter(attn_metadata.values()))
 
         if dataclasses.is_dataclass(attn_metadata):
-            # Normalize fields unused by the pure-attention draft proposer
-            # (gdn_read_offsets and num_spec_tokens) to match the warmup
-            # AttentionMetadata in CompilationManager._precompile_mtp_helpers
-            # and prevent runtime JAX JIT cache misses.
+            # Normalize gdn_read_offsets (unused by the pure-attention draft
+            # proposer) to match the warmup AttentionMetadata in
+            # CompilationManager._precompile_mtp_helpers and prevent runtime
+            # JAX JIT cache misses.
             attn_metadata = dataclasses.replace(
                 attn_metadata,
                 gdn_read_offsets=None,
-                num_spec_tokens=0,
             )
 
         req_ids = self.runner.input_batch.req_ids
