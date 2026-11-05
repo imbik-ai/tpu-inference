@@ -284,6 +284,8 @@ def quantize_tensor(
     dtype_max = float(dtype_info.max)
     dtype_min = float(dtype_info.min)
 
+    # Scale and divide in f32: in bf16, x / scale has 0.5-1.0 LSB steps near the int8 max.
+    tensor = tensor.astype(jnp.float32)
     abs_max = jnp.max(jnp.abs(tensor), axis=axis, keepdims=True)
     scale = abs_max / dtype_max
 
@@ -291,7 +293,11 @@ def quantize_tensor(
     # during inference, we convert them to inf.
     scale_inv = jnp.nan_to_num(1 / scale, jnp.inf)
 
-    tensor_q = jnp.clip(tensor * scale_inv, dtype_min, dtype_max)
+    tensor_q = tensor * scale_inv
+    if jnp.issubdtype(dtype, jnp.integer):
+        # astype truncates toward zero; round to nearest for int targets.
+        tensor_q = jnp.round(tensor_q)
+    tensor_q = jnp.clip(tensor_q, dtype_min, dtype_max)
     tensor_q = tensor_q.reshape(orig_shape)
     tensor_q = tensor_q.astype(dtype)
 
