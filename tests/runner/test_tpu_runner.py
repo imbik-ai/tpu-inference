@@ -166,6 +166,7 @@ class TestTPUJaxRunner:
         # `MagicMock` recurses on every `dtype` access).
         self.runner.input_batch.mamba_state_indices_cpu = np.zeros(
             self.runner.max_num_reqs, dtype=np.int32)
+        self.runner.input_batch._mamba_local_slots = 16
 
         # Mock block tables
         # there will be 2 block tables since there are 2 kv cache groups
@@ -898,6 +899,367 @@ class TestTPUJaxRunner:
             flat_results_b = runner_b.mesh.devices.flatten().tolist()
             assert flat_results_b == unordered_devices
 
+    @patch('tpu_inference.runner.tpu_runner.TPUSupportedSamplingMetadata')
+    def test_prepare_inputs_populates_gdn_read_offsets_and_num_spec_tokens(
+            self, mock_sampling_metadata):
+        """_prepare_inputs populates gdn_read_offsets and num_spec_tokens when has_mamba_layers and speculative_config are enabled."""
+        self._create_mock_hybrid_kv_cache_config()
+        self.runner.kv_cache_config.has_mamba_layers = True
+        self.runner.speculative_config = SimpleNamespace(
+            num_speculative_tokens=3)
+
+        req_state = MagicMock()
+        req_state.mamba_read_offset = 2
+        self.runner.requests = {'req1': req_state}
+
+        scheduler_output = MagicMock()
+        scheduler_output.total_num_scheduled_tokens = 4
+        scheduler_output.num_scheduled_tokens = {'req1': 4}
+        scheduler_output.scheduled_spec_decode_tokens = {'req1': [10, 11, 12]}
+        scheduler_output.grammar_bitmask = None
+
+        self.runner.input_batch = MagicMock()
+        self.runner.input_batch.max_decode_tokens = 4
+        self.runner.input_batch.num_reqs = 1
+        self.runner.input_batch.req_ids = ['req1']
+        self.runner.input_batch.req_id_to_index = {'req1': 0}
+        self.runner.input_batch.num_computed_tokens_cpu = np.array([10])
+        self.runner.input_batch.token_ids_cpu = np.random.randint(
+            0, 1000, (8, 64), dtype=np.int32)
+        self.runner.input_batch.mamba_state_indices_cpu = np.zeros(
+            self.runner.max_num_reqs, dtype=np.int32)
+        self.runner.input_batch._mamba_local_slots = 16
+
+        mock_block_table = MagicMock()
+        mock_block_table.max_num_blocks_per_req = 8
+        mock_block_table.get_cpu_tensor.return_value = np.zeros((1, 8),
+                                                                dtype=np.int32)
+        self.runner.input_batch.block_table = [
+            mock_block_table, mock_block_table
+        ]
+        mock_sampling_metadata.from_input_batch.return_value = MagicMock()
+
+        with patch('jax.device_put', side_effect=lambda x, *a, **kw: x):
+            output = self.runner._prepare_inputs(scheduler_output)
+        attention_metadata = output[2]
+        shared_attention_metadata = output[11]
+
+        assert shared_attention_metadata.num_spec_tokens == 3
+        for layer_md in attention_metadata.values():
+            assert layer_md.num_spec_tokens == 3
+            assert layer_md.gdn_read_offsets is not None
+            assert int(np.asarray(layer_md.gdn_read_offsets)[0]) == 2
+
+    @patch("tpu_inference.runner.tpu_runner.extract_last_sampled_tokens")
+    @patch(
+        "tpu_inference.runner.tpu_runner.runner_utils.host_extract_sampled_tokens"
+    )
+    def test_sample_from_logits_sync_updates_tokens_and_mamba_offset_before_propose(
+        self,
+        mock_host_extract,
+        mock_extract_last,
+    ):
+        """In sync mode, _sample_from_logits updates token_ids_cpu, num_tokens_no_spec, and mamba_read_offset BEFORE calling propose_draft_token_ids."""
+        self.runner.scheduler_config.async_scheduling = False
+        self.runner.speculative_config = SimpleNamespace(
+            num_speculative_tokens=3)
+        self.runner.aux_output_worker = None
+        self.runner.rng_params_for_sampling = self.mock_rng_key
+
+        req_state = SimpleNamespace(
+            req_id="req1",
+            num_computed_tokens=4,
+            num_tokens=4,
+            output_token_ids=[],
+            mamba_read_offset=0,
+        )
+        self.runner.requests = {"req1": req_state}
+        self.runner.input_batch = MagicMock()
+        self.runner.input_batch.num_reqs = 1
+        self.runner.input_batch.req_ids = ["req1"]
+        self.runner.input_batch.req_id_to_index = {"req1": 0}
+        self.runner.input_batch.vocab_size = 1000
+        self.runner.input_batch.token_ids_cpu = np.zeros((16, 64),
+                                                         dtype=np.int32)
+        self.runner.input_batch.token_ids_cpu[0, :4] = [10, 20, 30, 40]
+        self.runner.input_batch.num_tokens_no_spec = np.zeros(16,
+                                                              dtype=np.int32)
+        self.runner.input_batch.num_tokens_no_spec[0] = 4
+        self.runner.input_batch.num_tokens = np.zeros(16, dtype=np.int32)
+        self.runner.input_batch.num_tokens[0] = 4
+        self.runner.input_batch.num_prompt_logprobs = {}
+
+        # Simulate a verify step with 3 draft tokens (q_len=4), where 2 drafts + 1 bonus = 3 tokens are accepted (1 rejected -> mamba_read_offset = 4 - 1 - 1 = 2)
+        mock_host_extract.return_value = [[50, 60, 70]]
+        mock_extract_last.return_value = (
+            jnp.array([70], dtype=jnp.int32),
+            jnp.array([1], dtype=jnp.int32),
+        )
+
+        observed_in_propose = {}
+
+        def fake_propose(*args, **kwargs):
+            n = int(self.runner.input_batch.num_tokens_no_spec[0])
+            observed_in_propose["num_tokens_no_spec"] = n
+            observed_in_propose["tokens"] = (
+                self.runner.input_batch.token_ids_cpu[0, :n].tolist())
+            observed_in_propose["mamba_read_offset"] = (
+                req_state.mamba_read_offset)
+
+        self.runner.speculative_decoding_manager.propose_draft_token_ids = (
+            MagicMock(side_effect=fake_propose))
+        self.runner._select_from_array_fn = MagicMock(
+            return_value=jnp.zeros((1, 16), dtype=jnp.bfloat16))
+        self.runner._extract_draft_token_ids = MagicMock(
+            return_value=jnp.zeros((3, ), dtype=jnp.int32))
+        self.runner.rejection_sampler = MagicMock(
+            return_value=jnp.array([[50, 60, 70, -1]], dtype=jnp.int32))
+
+        tpu_sampling_metadata = SimpleNamespace(do_sampling=False,
+                                                logprobs=False)
+        spec_decode_metadata = SimpleNamespace(
+            bonus_logits_indices=jnp.array([0], dtype=jnp.int32),
+            target_logits_indices=jnp.array([0, 1, 2], dtype=jnp.int32),
+            final_logits_indices=jnp.array([0, 1, 2, 3], dtype=jnp.int32),
+            draft_lengths=jnp.array([3], dtype=jnp.int32),
+        )
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={"req1": 4},
+            scheduled_spec_decode_tokens={"req1": [50, 60, 99]},
+            total_num_scheduled_tokens=4,
+        )
+
+        with patch(
+                "tpu_inference.runner.tpu_runner.sample",
+                return_value=(
+                    jnp.array([70], dtype=jnp.int32),
+                    jnp.zeros((1, 16), dtype=jnp.float32),
+                ),
+        ) as mock_sample:
+            self.runner._sample_from_logits(
+                scheduler_output=scheduler_output,
+                attn_metadata=MagicMock(),
+                tpu_sampling_metadata=tpu_sampling_metadata,
+                input_ids=jnp.zeros((4, ), dtype=jnp.int32),
+                hidden_states=jnp.zeros((4, 8), dtype=jnp.float32),
+                logits=jnp.zeros((4, 16), dtype=jnp.bfloat16),
+                aux_hidden_states=None,
+                spec_decode_metadata=spec_decode_metadata,
+                kv_connector_output=None,
+                padded_num_reqs=1,
+            )
+
+        assert mock_sample.call_args[0][2].dtype == jnp.float32
+        assert observed_in_propose["num_tokens_no_spec"] == 7
+        assert observed_in_propose["tokens"] == [10, 20, 30, 40, 50, 60, 70]
+        assert observed_in_propose["mamba_read_offset"] == 2
+
+    def test_jax_logprobs_materialize_spec_decode_zero_draft_tokens(self):
+        from vllm.v1.outputs import LogprobsTensors
+
+        from tpu_inference.runner.tpu_runner import _jax_logprobs_materialize
+
+        # Simulate a prefill or 0-draft step with spec_decode enabled:
+        # 4 padded draft slots (all -1 placeholders) + 2 bonus slots (tokens 42, 99).
+        logprob_token_ids = jnp.array(
+            [[-1, 5], [-1, 5], [-1, 5], [-1, 5], [42, 7], [99, 8]],
+            dtype=jnp.int32,
+        )
+        logprobs = jnp.zeros((6, 2), dtype=jnp.float32)
+        selected_token_ranks = jnp.ones((6, ), dtype=jnp.int32)
+        tensors = LogprobsTensors(
+            logprob_token_ids=logprob_token_ids,
+            logprobs=logprobs,
+            selected_token_ranks=selected_token_ranks,
+        )
+        spec_decode_metadata = SimpleNamespace(
+            final_logits_indices=jnp.zeros((4, ), dtype=jnp.int32),
+            draft_lengths_cpu=np.array([0, 0], dtype=np.int32),
+            req_indices_dp={0: [0, 1]},
+        )
+        self.runner.input_batch.vocab_size = 1000
+        self.runner.dp_size = 1
+
+        res = _jax_logprobs_materialize(
+            tensors,
+            logits_indices_selector=[0, 1],
+            runner=self.runner,
+            spec_decode_metadata=spec_decode_metadata,
+            num_reqs=2,
+        )
+        assert res.logprob_token_ids[:, 0].tolist() == [42, 99]
+        assert res.cu_num_generated_tokens == [0, 1, 2]
+
+    @patch('tpu_inference.runner.tpu_runner.TPUSupportedSamplingMetadata')
+    def test_prepare_inputs_align_spec_decode_scratch_metadata(
+            self, mock_sampling_metadata):
+        """Align mode + spec decode passes the scratch group bases as
+        mamba_state_indices and marks requests that resume from the block
+        table (previous step was not a verify window) with offset -1."""
+        self._create_mock_hybrid_kv_cache_config()
+        self.runner.kv_cache_config.has_mamba_layers = True
+        self.runner.speculative_config = SimpleNamespace(
+            num_speculative_tokens=3)
+        self.runner.vllm_config.speculative_config = (
+            self.runner.speculative_config)
+        self.runner.cache_config.mamba_cache_mode = "align"
+        self.runner.vllm_config.cache_config.mamba_cache_mode = "align"
+
+        window_req = MagicMock()
+        window_req.mamba_read_offset = 2
+        prefill_req = MagicMock()
+        prefill_req.mamba_read_offset = -1
+        self.runner.requests = {'req1': window_req, 'req2': prefill_req}
+
+        scheduler_output = MagicMock()
+        scheduler_output.total_num_scheduled_tokens = 8
+        scheduler_output.num_scheduled_tokens = {'req1': 4, 'req2': 4}
+        scheduler_output.scheduled_spec_decode_tokens = {
+            'req1': [10, 11, 12],
+            'req2': [13, 14, 15]
+        }
+        scheduler_output.grammar_bitmask = None
+
+        self.runner.input_batch = MagicMock()
+        self.runner.input_batch.max_decode_tokens = 4
+        self.runner.input_batch.num_reqs = 2
+        self.runner.input_batch.req_ids = ['req1', 'req2']
+        self.runner.input_batch.req_id_to_index = {'req1': 0, 'req2': 1}
+        self.runner.input_batch.num_computed_tokens_cpu = np.array([10, 20])
+        self.runner.input_batch.token_ids_cpu = np.random.randint(
+            0, 1000, (8, 64), dtype=np.int32)
+        self.runner.input_batch.mamba_state_indices_cpu = np.zeros(
+            self.runner.max_num_reqs, dtype=np.int32)
+        self.runner.input_batch.mamba_state_indices_cpu[:2] = [9, 13]
+        self.runner.input_batch._mamba_local_slots = 64
+
+        mock_block_table = MagicMock()
+        mock_block_table.max_num_blocks_per_req = 8
+        mock_block_table.get_cpu_tensor.return_value = np.zeros((2, 8),
+                                                                dtype=np.int32)
+        self.runner.input_batch.block_table = [
+            mock_block_table, mock_block_table
+        ]
+        mock_sampling_metadata.from_input_batch.return_value = MagicMock()
+
+        with patch('jax.device_put', side_effect=lambda x, *a, **kw: x):
+            output = self.runner._prepare_inputs(scheduler_output)
+        attention_metadata = output[2]
+
+        for layer_md in attention_metadata.values():
+            assert layer_md.mamba_state_indices is not None
+            np.testing.assert_array_equal(
+                np.asarray(layer_md.mamba_state_indices)[:2], [9, 13])
+            np.testing.assert_array_equal(
+                np.asarray(layer_md.gdn_read_offsets)[:2], [2, -1])
+
+    def test_update_mamba_read_state_sync_and_async(self):
+        """Verify windows resume from the checkpoint of their last accepted
+        token; under async scheduling (no host-side acceptance counts) the
+        offset assumes all drafts were accepted. Prefill chunks reset it to -1."""
+        self.runner.speculative_config = SimpleNamespace(
+            num_speculative_tokens=3)
+        self.runner.input_batch = MagicMock()
+        self.runner.input_batch.max_decode_tokens = 4
+        window = SimpleNamespace(mamba_read_offset=-1)
+        prefill = SimpleNamespace(mamba_read_offset=3)
+        self.runner.requests = {'win': window, 'pre': prefill}
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={
+                'win': 4,
+                'pre': 100
+            },
+            scheduled_spec_decode_tokens={'win': [1, 2, 3]})
+
+        # Sync: 1 draft + bonus sampled -> 2 drafts rejected.
+        self.runner._update_mamba_read_state(['win', 'pre'], scheduler_output,
+                                             [], [[7, 8], [9]])
+        assert window.mamba_read_offset == 1
+        assert prefill.mamba_read_offset == -1
+
+        # Async: acceptance unknown on the host, corrected on TPU later.
+        self.runner._update_mamba_read_state(['win', 'pre'], scheduler_output,
+                                             [], None)
+        assert window.mamba_read_offset == 3
+
+    @patch(
+        "tpu_inference.runner.tpu_runner.runner_utils.host_extract_sampled_tokens"
+    )
+    def test_modify_prev_results_corrects_mamba_offset_for_unscheduled_request(
+            self, mock_host_extract):
+        """When an async verify-window request is paused (unscheduled in the
+        next step), _modify_prev_results subtracts rejected drafts from its
+        preserved mamba_read_offset, while leaving preempted requests (-1)
+        untouched."""
+        self.runner.speculative_config = SimpleNamespace(
+            num_speculative_tokens=3)
+        paused = SimpleNamespace(mamba_read_offset=3,
+                                 output_token_ids=[0, 0, 0, 0])
+        preempted = SimpleNamespace(mamba_read_offset=-1,
+                                    output_token_ids=[0, 0, 0, 0])
+        self.runner.requests = {'paused': paused, 'preempted': preempted}
+        self.runner.input_batch = MagicMock()
+        self.runner.input_batch.req_id_to_index = {}
+
+        pre_scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={
+            'paused': [10, 11, 12],
+            'preempted': [20, 21, 22],
+        })
+        self.runner._pre_async_results = SimpleNamespace(
+            req_ids=['paused', 'preempted'],
+            next_tokens=MagicMock(),
+            request_seq_lens=[(0, paused, 4), (1, preempted, 4)],
+            discard_sampled_tokens_req_indices=[],
+            logits_indices_selector=None,
+            spec_decode_metadata=MagicMock(),
+            scheduler_output=pre_scheduler_output,
+            is_continue_decode=False,
+        )
+        # 'paused' had 1 draft + 1 bonus accepted (2 rejected out of 3 drafts):
+        # mamba_read_offset should be corrected from 3 to 3 - (3 + 1 - 2) = 1.
+        mock_host_extract.return_value = [[10, 99], [20]]
+
+        self.runner._modify_prev_results()
+
+        assert paused.mamba_read_offset == 1
+        assert preempted.mamba_read_offset == -1
+
+    def test_subtract_gdn_read_offsets_fn(self):
+        from tpu_inference.runner.tpu_runner import \
+            _subtract_gdn_read_offsets_fn
+        offsets = jnp.array([3, -1, 2, 3], dtype=jnp.int32)
+        num_rejected = jnp.array([2, 1, 5, 0], dtype=jnp.int32)
+        # Request 0 uses rejection slot 0, request 1 resumes from the block
+        # table (-1 offset), request 2 did not run spec decode last step.
+        indices = jnp.array([0, 1, -1, 3], dtype=jnp.int32)
+        out = _subtract_gdn_read_offsets_fn(offsets, num_rejected, indices)
+        np.testing.assert_array_equal(np.asarray(out), [1, -1, 2, 3])
+
+    def test_wire_mamba_state_requires_batched_decode_with_spec(self):
+        """GDN prefix caching (align mode) + spec decode must fail loudly when
+        verify windows would not run in the decode segment
+        (USE_BATCHED_RPA_KERNEL unset), whereas mamba_cache_mode='none' (e.g.
+        Qwen3.5 MTP with prefix caching disabled) does not raise."""
+        self.runner.speculative_config = SimpleNamespace(
+            num_speculative_tokens=3)
+        self.runner.vllm_config.speculative_config = (
+            self.runner.speculative_config)
+        self.runner.input_batch = MagicMock()
+        self.runner.input_batch.max_decode_tokens = 1
+        self.runner.kv_cache_manager.actual_mamba_num_blocks = 64
+        kv_cache_config = MagicMock(has_mamba_layers=True)
+
+        self.runner.cache_config.mamba_cache_mode = "align"
+        self.runner.vllm_config.cache_config.mamba_cache_mode = "align"
+        with pytest.raises(ValueError, match="USE_BATCHED_RPA_KERNEL"):
+            self.runner._wire_input_batch_mamba_state(kv_cache_config)
+
+        self.runner.cache_config.mamba_cache_mode = "none"
+        self.runner.vllm_config.cache_config.mamba_cache_mode = "none"
+        self.runner._wire_input_batch_mamba_state(kv_cache_config)
+        self.runner.input_batch.init_mamba_pools.assert_called_once_with(
+            64, scratch_slots_per_rank=0)
+
 
 class TestTPUJaxRunnerMultimodalModelLoadedForTextOnly:
 
@@ -1135,6 +1497,7 @@ class TestTPUJaxRunnerDisableMM:
         """_can_use_continue_decode checks enable flag, distribution, structured outputs, and prompt chunking."""
         runner = MagicMock()
         runner.enable_continue_decode = True
+        runner.speculative_config = None
         runner.input_batch.num_reqs = 2
         runner.input_batch.request_distribution = [2, 0, 2]  # decode only
         runner.input_batch.num_computed_tokens_cpu = np.array([10, 20],
@@ -1148,6 +1511,12 @@ class TestTPUJaxRunnerDisableMM:
         # 1. Nominal case: decode-only, tokens computed >= prompt tokens -> True
         assert TPUModelRunner._can_use_continue_decode(runner,
                                                        sched_out) is True
+
+        # 1b. Speculative decoding enabled -> False
+        runner.speculative_config = MagicMock()
+        assert TPUModelRunner._can_use_continue_decode(runner,
+                                                       sched_out) is False
+        runner.speculative_config = None
 
         # 2. Disabled flag -> False
         runner.enable_continue_decode = False

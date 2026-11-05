@@ -28,6 +28,7 @@ from vllm.utils.math_utils import round_down
 
 import tpu_inference.envs as envs
 from tpu_inference.core.disagg_utils import is_disagg_enabled
+from tpu_inference.core.hybrid_coordinator import uses_gdn_spec_scratch
 from tpu_inference.core.sched.utils import DEFAULT_MAX_DECODE_STEPS
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, GroupedAttentionMetadata, SharedAttentionMetadata)
@@ -480,10 +481,11 @@ class CompilationManager:
         # Dummy mamba_state_indices for compile-cache pre-tracing. Only
         # populate for hybrid attn+mamba models without align mode — for pure-attention models
         # and mamba align mode we pass None at runtime (see `_prepare_inputs`), and the precompile
-        # primer must match that shape so the cached HLO is reused.
-        if (self.runner.kv_cache_config.has_mamba_layers
-                and getattr(self.runner.cache_config, "mamba_cache_mode",
-                            "none") != "align"):
+        # primer must match that shape so the cached HLO is reused. Align mode
+        # with spec decode passes the scratch group bases, so populate those.
+        if self.runner.kv_cache_config.has_mamba_layers and (
+                getattr(self.runner.cache_config, "mamba_cache_mode", "none")
+                != "align" or uses_gdn_spec_scratch(self.runner.vllm_config)):
             mamba_state_indices = device_array(self.runner.mesh,
                                                np.zeros(
                                                    self.runner.max_num_reqs,
@@ -491,6 +493,17 @@ class CompilationManager:
                                                sharding=metadata_attn_sharding)
         else:
             mamba_state_indices = None
+
+        num_spec_tokens = (
+            self.runner.speculative_config.num_speculative_tokens
+            if self.runner.speculative_config else 0)
+        if self.runner.kv_cache_config.has_mamba_layers and num_spec_tokens > 0:
+            gdn_read_offsets = device_array(self.runner.mesh,
+                                            np.zeros(self.runner.max_num_reqs,
+                                                     dtype=np.int32),
+                                            sharding=metadata_attn_sharding)
+        else:
+            gdn_read_offsets = None
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
@@ -517,6 +530,8 @@ class CompilationManager:
                 backend_metadata=attention_backend.backend_metadata(
                     attention_arrays, gid),
                 is_decode=is_decode,
+                gdn_read_offsets=gdn_read_offsets,
+                num_spec_tokens=num_spec_tokens,
             )
 
             return attention_metadata_gid
@@ -530,6 +545,8 @@ class CompilationManager:
                 mamba_state_indices=mamba_state_indices,
                 padded_num_reqs=num_reqs,
                 is_decode=is_decode,
+                gdn_read_offsets=gdn_read_offsets,
+                num_spec_tokens=num_spec_tokens,
             )
 
         attention_metadata: AttentionMetadata | dict[str, AttentionMetadata]
@@ -701,6 +718,22 @@ class CompilationManager:
                 seq_lens_subtract_indices,
                 positions_subtract_indices,
                 num_tokens=num_tokens,
+            )
+
+        if self.runner.kv_cache_config.has_mamba_layers:
+            from tpu_inference.runner.tpu_runner import \
+                _subtract_gdn_read_offsets_fn
+            metadata_sharding = NamedSharding(
+                self.runner.mesh, PartitionSpec(ShardingAxisName.BATCH))
+            self._run_compilation(
+                "_subtract_gdn_read_offsets_fn",
+                _subtract_gdn_read_offsets_fn,
+                self._create_dummy_tensor((self.runner.max_num_reqs, ),
+                                          jnp.int32, metadata_sharding),
+                self._create_dummy_tensor((self.runner.max_num_reqs, ),
+                                          jnp.int32, dp_sharding),
+                self._create_dummy_tensor((self.runner.max_num_reqs, ),
+                                          jnp.int32, replicated_sharding),
             )
 
     def _precompile_concat_last_sampled_tokens_and_draft_tokens(self) -> None:
@@ -1518,6 +1551,18 @@ class CompilationManager:
                     num_logits=num_logits,
                     num_reqs=num_reqs,
                 )
+                if (self.runner.scheduler_config.async_scheduling
+                        and not getattr(sampled_token_ids,
+                                        "is_fully_addressable", True)):
+                    from tpu_inference.runner.tpu_runner import \
+                        _replicate_tokens_for_host
+                    self._run_compilation(
+                        f"worker{self.runner.rank} _replicate_tokens_for_host",
+                        _replicate_tokens_for_host,
+                        sampled_token_ids,
+                        num_logits=num_logits,
+                        num_reqs=num_reqs,
+                    )
 
     def _precompile_rejection_sampler(self) -> None:
         logger.info("Compiling rejection_sampler with different input shapes.")
@@ -1622,7 +1667,9 @@ class CompilationManager:
         # ForbidCompile guard inside `Eagle3Proposer.propose` raises. None for
         # pure-attention models (the common eagle3 case) so the field stays
         # absent end-to-end.
-        if self.runner.kv_cache_config.has_mamba_layers:
+        if self.runner.kv_cache_config.has_mamba_layers and (
+                getattr(self.runner.cache_config, "mamba_cache_mode", "none")
+                != "align" or uses_gdn_spec_scratch(self.runner.vllm_config)):
             eagle3_mamba_state_indices = device_array(
                 self.runner.mesh,
                 np.zeros(self.runner.max_num_reqs, dtype=np.int32),
@@ -1635,6 +1682,9 @@ class CompilationManager:
                                                 sharding=dp_sharding)
         last_token_indices = self._create_dummy_tensor(
             (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+        num_spec_tokens = (
+            self.runner.speculative_config.num_speculative_tokens
+            if self.runner.speculative_config else 0)
         for num_tokens in self.runner.num_tokens_paddings:
             for num_reqs in self.runner.attn_num_reqs_paddings:
                 positions = self._create_dummy_tensor((num_tokens, ),
@@ -1647,6 +1697,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=eagle3_mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    num_spec_tokens=num_spec_tokens,
                 )
 
                 def drafter_propose_warmup(_fn, _args, _call_kwargs):
@@ -1757,7 +1808,9 @@ class CompilationManager:
         # ForbidCompile guard inside `Eagle3Proposer.propose` raises. None for
         # pure-attention models (the common eagle3 case) so the field stays
         # absent end-to-end.
-        if self.runner.kv_cache_config.has_mamba_layers:
+        if self.runner.kv_cache_config.has_mamba_layers and (
+                getattr(self.runner.cache_config, "mamba_cache_mode", "none")
+                != "align" or uses_gdn_spec_scratch(self.runner.vllm_config)):
             mamba_state_indices = device_array(self.runner.mesh,
                                                np.zeros(
                                                    self.runner.max_num_reqs,
@@ -1766,6 +1819,9 @@ class CompilationManager:
         else:
             mamba_state_indices = None
 
+        num_spec_tokens = (
+            self.runner.speculative_config.num_speculative_tokens
+            if self.runner.speculative_config else 0)
         num_reqs_dp = self._create_dummy_tensor((dp_size, ),
                                                 jnp.int32,
                                                 sharding=dp_sharding)
@@ -1791,6 +1847,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    num_spec_tokens=num_spec_tokens,
                 )
 
                 def drafter_propose_warmup(_fn, _args, _call_kwargs):

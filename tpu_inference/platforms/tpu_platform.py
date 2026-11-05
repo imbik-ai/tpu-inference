@@ -400,15 +400,39 @@ class TpuPlatform(Platform):
                 "pool is sized for resident state only. Use 'align' (the "
                 "default when prefix caching is enabled) or 'none'.")
 
-        # Hybrid (mamba/linear-attention) models cannot use prefix caching with
-        # speculative decoding because verify windows need consecutive state slots.
+        # Hybrid (mamba/linear-attention) models on TPU require align mode for
+        # prefix caching. Custom TPU architectures (like MaxTextForCausalLM) may
+        # not be in vLLM's MODELS_CONFIG_MAP when check_and_update_config runs,
+        # so default mamba_cache_mode to 'align' when prefix caching is enabled
+        # on a hybrid model.
+        is_hybrid_model = bool(
+            getattr(vllm_config.model_config, "is_hybrid", False) or
+            (isinstance(vllm_config.additional_config, dict) and
+             "custom_mamba_cache_multiplier" in vllm_config.additional_config))
+        if (cache_config and cache_config.enable_prefix_caching
+                and is_hybrid_model and getattr(
+                    cache_config, "mamba_cache_mode", "none") == "none"):
+            cache_config.mamba_cache_mode = "align"
+
+        # Hybrid (mamba/linear-attention) models support prefix caching with
+        # speculative decoding (n-gram or MTP) when USE_BATCHED_RPA_KERNEL=1
+        # places verify windows in the decode segment: verify windows checkpoint
+        # into runner-owned scratch slots and block-boundary states are copied
+        # into the scheduler's mamba blocks. Other proposers or non-batched RPA
+        # keep prefix caching off.
         if (cache_config and getattr(cache_config, "mamba_cache_mode", "none")
                 == "align"):
-            if vllm_config.speculative_config is not None:
+            speculative_config = vllm_config.speculative_config
+            spec_method = getattr(speculative_config, "method", None)
+            if speculative_config is not None and (spec_method not in (
+                    "ngram", "mtp") or not envs.USE_BATCHED_RPA_KERNEL):
                 logger.warning(
                     "[tpu_platform] Disabling prefix caching: hybrid "
-                    "(mamba/linear-attention) models do not support cached "
-                    "prefixes with speculative decoding on TPU.")
+                    "(mamba/linear-attention) models only support cached "
+                    "prefixes with n-gram or MTP speculative decoding and "
+                    "USE_BATCHED_RPA_KERNEL=1 on TPU "
+                    "(got method=%r, USE_BATCHED_RPA_KERNEL=%s).", spec_method,
+                    envs.USE_BATCHED_RPA_KERNEL)
                 cache_config.enable_prefix_caching = False
                 cache_config.mamba_cache_mode = "none"
                 if (getattr(cache_config, "mamba_block_size", None) is not None
@@ -577,7 +601,7 @@ class TpuPlatform(Platform):
             if cache_config.mamba_block_size != cache_config.block_size:
                 logger.info(
                     "Setting mamba_block_size to %d to match the attention "
-                    "block size (was %d) for mamba prefix caching.",
+                    "block size (was %s) for mamba prefix caching.",
                     cache_config.block_size, cache_config.mamba_block_size)
                 cache_config.mamba_block_size = cache_config.block_size
             if (cache_config.prefix_match_unit is not None and
