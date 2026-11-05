@@ -1704,9 +1704,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         if spec_decode_metadata is not None:
             placeholder_req_id_to_index.clear()
+            # A request whose sampled token is discarded (a chunked prefill, or
+            # the recompute of a preempted request's prompt and output tokens)
+            # gets no placeholder: its next step is not a verify window, and
+            # substituting into it would read a token that was never kept.
+            discarded_req_ids = {
+                self.input_batch.req_ids[i]
+                for i in discard_sampled_tokens_req_indices
+            }
             for rank in range(self.dp_size):
                 for i, req_id in enumerate(
                         spec_decode_metadata.req_ids_dp[rank]):
+                    if req_id in discarded_req_ids:
+                        continue
                     placeholder_req_id_to_index[req_id] = i + rank * (
                         self.max_num_reqs // self.dp_size)
 
