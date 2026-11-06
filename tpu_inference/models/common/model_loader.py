@@ -60,7 +60,7 @@ _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset({
     "KimiK25ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
-    # rect-capacity: vLLM's Qwen3.5 MTP drafter runs on the torchax path like its target.
+    # vLLM's Qwen3.5 MTP drafter runs on the torchax path like its target.
     "Qwen3_5MTP",
     "Qwen3_5MoeMTP",
 })

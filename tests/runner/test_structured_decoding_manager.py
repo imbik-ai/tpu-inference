@@ -270,6 +270,61 @@ class TestStructuredDecodingManager:
             expected_bitmask[0:4] = np.stack(rows[4:8])  # req-1: 4 rows
             expected_bitmask[5:7] = np.stack(rows[0:2])  # req-3: 2 rows
             np.testing.assert_array_equal(np.array(bitmask), expected_bitmask)
-            expected_require = np.array(
-                [[True]] * 4 + [[False]] + [[True]] * 2 + [[False]])
+            expected_require = np.array([[True]] * 4 + [[False]] +
+                                        [[True]] * 2 + [[False]])
+            np.testing.assert_array_equal(np.array(require), expected_require)
+
+    def test_structured_decoding_spec_decode_no_drafts(self):
+        # With spec decode on, vLLM keeps mask_stride rows per structured
+        # request on a step where no request has drafts, so the dict is empty
+        # and each request still reads the first row of its own block.
+        self.runner.model_config.get_vocab_size = MagicMock(return_value=64)
+        self.runner._init_inputs()
+
+        def mock_device_array(mesh, *args, sharding=None, **kwargs):
+            return args[0] if len(args) == 1 else args
+
+        with patch(
+                'tpu_inference.runner.structured_decoding_manager.device_array',
+                side_effect=mock_device_array):
+            params = MagicMock()
+            params.sampling_type = SamplingType.GREEDY
+            params.temperature = 0.0
+            params.top_p = 1.0
+            params.top_k = -1
+            params.min_tokens = 0
+            params.logprobs = None
+            params.logit_bias = None
+            params.allowed_token_ids = set()
+            params.bad_words_token_ids = None
+            params.all_stop_token_ids = set()
+            for i in (1, 2, 3):
+                self.runner.input_batch.add_request(
+                    CachedRequestState(req_id=f"req-{i}",
+                                       prompt_token_ids=[i],
+                                       output_token_ids=[],
+                                       sampling_params=params,
+                                       block_ids=([i], ),
+                                       num_computed_tokens=1,
+                                       lora_request=None,
+                                       mm_features=[],
+                                       pooling_params=None,
+                                       generator=None))
+
+            grammar_output = MagicMock()
+            grammar_output.structured_output_request_ids = ["req-3", "req-1"]
+            # mask_stride 4: req-3 owns bitmask rows 0-3, req-1 rows 4-7.
+            rows = [np.array([r, -r], dtype=np.int32) for r in range(1, 9)]
+            grammar_output.grammar_bitmask = np.stack(rows)
+
+            logits = jnp.ones((4, self.runner.vocab_size), dtype=jnp.bfloat16)
+            require, bitmask, _ = (self.runner.structured_decoding_manager.
+                                   prepare_structured_decoding_input(
+                                       logits, grammar_output, {}))
+
+            expected_bitmask = np.zeros((4, 2), dtype=np.int32)
+            expected_bitmask[0] = rows[4]  # req-1
+            expected_bitmask[2] = rows[0]  # req-3
+            np.testing.assert_array_equal(np.array(bitmask), expected_bitmask)
+            expected_require = np.array([[True], [False], [True], [False]])
             np.testing.assert_array_equal(np.array(require), expected_require)

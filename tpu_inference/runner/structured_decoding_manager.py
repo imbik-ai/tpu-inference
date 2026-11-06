@@ -69,7 +69,10 @@ class StructuredDecodingManager:
         grammar_output: "GrammarOutput",
         scheduled_spec_decode_tokens: Optional[dict[str, list[int]]] = None,
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
-        if scheduled_spec_decode_tokens:
+        # With spec decode on, vLLM lays out mask_stride rows per structured
+        # request even on a step with no drafts, so an empty dict takes the
+        # spec path too.
+        if scheduled_spec_decode_tokens is not None:
             return self._prepare_spec_decode_input(
                 logits, grammar_output, scheduled_spec_decode_tokens)
         grammar_bitmask = grammar_output.grammar_bitmask

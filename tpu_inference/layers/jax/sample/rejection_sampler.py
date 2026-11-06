@@ -312,7 +312,8 @@ def _compute_probs(
     # Greedy requests in a sampling batch carry GREEDY_TEMPERATURE (InputBatch
     # stores -1.0 for them). Dividing by it would negate their logits and make
     # the verify step pick the least likely tokens, so they get a one-hot
-    # target at the argmax instead, as in vLLM's GPU rejection sampler.
+    # target at the argmax instead, which accepts a draft only when it is the
+    # argmax, as vLLM's GPU rejection sampler does for greedy rows.
     is_greedy = jnp.expand_dims(temperatures == GREEDY_TEMPERATURE, axis=-1)
     greedy_probs = jax.nn.one_hot(jnp.argmax(logits, axis=-1),
                                   logits.shape[-1],

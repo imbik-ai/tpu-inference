@@ -25,7 +25,10 @@ from tpu_inference.runner.tpu_runner import TPUModelRunner
 def _runner():
     input_batch = SimpleNamespace(
         req_ids=["decode", "recompute"],
-        req_id_to_index={"decode": 0, "recompute": 1},
+        req_id_to_index={
+            "decode": 0,
+            "recompute": 1
+        },
         num_tokens_no_spec=np.array([100, 0], dtype=np.int64),
         num_tokens=np.array([100, 0], dtype=np.int64),
         # "recompute": prompt 50 tokens, 30 output tokens known, 60 computed.
