@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 
 from tpu_inference.layers.jax.sample.rejection_sampler import (
-    GREEDY_TEMPERATURE, PLACEHOLDER_TOKEN_ID, RejectionSampler,
+    GREEDY_TEMPERATURE, PLACEHOLDER_TOKEN_ID, RejectionSampler, _compute_probs,
     _mask_top_k_top_p_candidates, _mask_top_k_top_p_full_vocab)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
@@ -1697,6 +1697,33 @@ class TestTopKTopPSampling:
 class TestTopKTopPCandidateMask:
     """The candidate mask must match the full-vocab binary-search mask."""
 
+    @staticmethod
+    def _special_rows(vocab_size):
+        rows, top_k, top_p = [], [], []
+        # 200 tied tokens at the top: the top-k set and the top-p set run past
+        # the 64 candidates.
+        tied = np.full(vocab_size, -20.0, dtype=np.float32)
+        tied[:200] = 0.0
+        for k, p in [(5, 0.9), (64, 0.5), (20, 0.99)]:
+            rows.append(tied)
+            top_k.append(k)
+            top_p.append(p)
+        # Fewer finite logits than top_k, as a grammar bitmask leaves them.
+        sparse = np.full(vocab_size, -np.inf, dtype=np.float32)
+        sparse[[3, 70, 900]] = [1.0, 2.0, 0.5]
+        rows.append(sparse)
+        top_k.append(20)
+        top_p.append(0.95)
+        # One dominant token.
+        dominant = np.zeros(vocab_size, dtype=np.float32)
+        dominant[7] = 40.0
+        for k, p in [(20, 1.0), (64, 1.0), (20, 0.95)]:
+            rows.append(dominant)
+            top_k.append(k)
+            top_p.append(p)
+        return (jnp.asarray(np.stack(rows)), jnp.array(top_k, dtype=jnp.int32),
+                jnp.array(top_p, dtype=jnp.float32))
+
     @pytest.mark.parametrize("coarse", [False, True])
     def test_candidate_mask_matches_full_vocab(self, coarse):
         vocab_size = 4096
@@ -1710,6 +1737,10 @@ class TestTopKTopPCandidateMask:
         if coarse:
             # Many ties at the top-k and top-p cutoffs.
             logits = jnp.round(logits)
+        special_logits, special_k, special_p = self._special_rows(vocab_size)
+        logits = jnp.concatenate([logits, special_logits])
+        top_k = jnp.concatenate([top_k, special_k])
+        top_p = jnp.concatenate([top_p, special_p])
 
         expected = _mask_top_k_top_p_full_vocab(logits, top_k, top_p)
         actual = _mask_top_k_top_p_candidates(logits, top_k, top_p)
@@ -1717,3 +1748,44 @@ class TestTopKTopPCandidateMask:
         np.testing.assert_array_equal(np.isfinite(actual),
                                       np.isfinite(expected))
         np.testing.assert_array_equal(actual, expected)
+
+    def test_candidate_mask_keeps_top_k_when_top_p_rounds(self):
+        # The top-k mass can sum to less than a top_p this close to 1, so the
+        # top-p cutoff runs off the end of the candidates.
+        vocab_size = 4096
+        logits = 3 * jax.random.normal(jax.random.PRNGKey(1), (4, vocab_size))
+        top_k = jnp.array([5, 20, 5, 20], dtype=jnp.int32)
+        top_p = jnp.array([1 - 2**-24, 1 - 2**-24, 1 - 2**-23, 1 - 2**-23],
+                          dtype=jnp.float32)
+
+        actual = _mask_top_k_top_p_candidates(logits, top_k, top_p)
+
+        np.testing.assert_array_equal(
+            np.isfinite(actual).sum(axis=-1), np.asarray(top_k))
+
+    def test_compute_probs_mixed_batch(self):
+        # Rows the candidate mask does not cover (top-p only, top_k above
+        # DISTRIBUTED_SAMPLING_MAX_TOP_K) send the batch to the full-vocab
+        # masks.
+        vocab_size = 4096
+        top_k = jnp.array([20, -1, 100, 0], dtype=jnp.int32)
+        top_p = jnp.array([0.95, 0.5, 0.9, 1.0], dtype=jnp.float32)
+        logits = 3 * jax.random.normal(jax.random.PRNGKey(2),
+                                       (top_k.shape[0], vocab_size))
+        metadata = TPUSupportedSamplingMetadata(do_sampling=True,
+                                                logprobs=False,
+                                                top_k=top_k,
+                                                top_p=top_p,
+                                                temperature=jnp.ones(
+                                                    (top_k.shape[0], ),
+                                                    dtype=jnp.float32))
+        num_draft_tokens = jnp.ones((top_k.shape[0], ), dtype=jnp.int32)
+
+        actual = jax.jit(_compute_probs)(logits, num_draft_tokens, metadata)
+
+        expected = jax.nn.softmax(
+            _mask_top_k_top_p_full_vocab(logits, top_k, top_p))
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+        np.testing.assert_array_equal(
+            np.asarray(actual) > 0,
+            np.asarray(expected) > 0)

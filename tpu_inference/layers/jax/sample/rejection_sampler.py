@@ -343,13 +343,20 @@ def _mask_top_k_top_p_full_vocab(logits: jax.Array, top_k: jax.Array,
 
 def _mask_top_k_top_p_candidates(logits: jax.Array, top_k: jax.Array,
                                  top_p: jax.Array) -> jax.Array:
-    """Same mask as `_mask_top_k_top_p_full_vocab` for rows with top-k in
+    """`_mask_top_k_top_p_full_vocab` for rows with top-k in
     (0, DISTRIBUTED_SAMPLING_MAX_TOP_K] or no top-k and no top-p.
 
     The full-vocab masks run a 32-step binary search each, so 65 passes over
     the logits. Here both cutoffs come from each row's top max_top_k
-    candidates, plus two passes over the logits: one for the softmax sum of
-    the top-k set and one to apply the cutoff.
+    candidates (`_shard_topk_candidates` returns them in descending order),
+    plus two passes over the logits: one for the softmax sum of the top-k set
+    and one to apply the cutoff.
+
+    The top-k cutoff is the same. The top-p cutoff is the same except where
+    float32 rounding decides it: the cumulative mass within rounding error of
+    top_p, or two tokens whose probabilities round to the same value. Both
+    sums are in float32, but in a different order, so either mask can keep a
+    token there that the other drops.
     """
     max_top_k = _distributed_sampling_max_top_k()
     values, _ = _shard_topk_candidates(logits, max_top_k)
@@ -364,13 +371,13 @@ def _mask_top_k_top_p_candidates(logits: jax.Array, top_k: jax.Array,
                     keepdims=True)
     probs = jnp.where(values >= kth, jnp.exp(values - row_max), 0.0) / total
     # `values` is in descending order, so the top-p set is a prefix of it. A
-    # set that does not close inside the candidates ends in kth ties.
+    # set that does not close inside the candidates ends in kth ties, and
+    # values[max_top_k - 1] <= kth, so the maximum keeps the top-k set then.
     cumulative = jnp.cumsum(probs, axis=-1)
     cutoff = jnp.sum(cumulative < top_p[:, None], axis=-1, keepdims=True)
     topp = jnp.take_along_axis(values,
                                jnp.minimum(cutoff, max_top_k - 1),
                                axis=-1)
-    topp = jnp.where(cutoff < max_top_k, topp, kth)
     threshold = jnp.where((top_p < 1.0)[:, None], jnp.maximum(kth, topp), kth)
     threshold = jnp.where((top_k > 0)[:, None], threshold, -jnp.inf)
     return jnp.where(logits >= threshold, logits, -jnp.inf)
