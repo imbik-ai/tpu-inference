@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from tpu_inference.utils import device_array
 
@@ -63,8 +64,14 @@ class StructuredDecodingManager:
         return jnp.where(require_struct_decoding, masked_logits, logits)
 
     def prepare_structured_decoding_input(
-        self, logits: jax.Array, grammar_output: "GrammarOutput"
+        self,
+        logits: jax.Array,
+        grammar_output: "GrammarOutput",
+        scheduled_spec_decode_tokens: Optional[dict[str, list[int]]] = None,
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        if scheduled_spec_decode_tokens:
+            return self._prepare_spec_decode_input(
+                logits, grammar_output, scheduled_spec_decode_tokens)
         grammar_bitmask = grammar_output.grammar_bitmask
         assert grammar_bitmask is not None
         num_reqs, _ = logits.shape
@@ -98,3 +105,47 @@ class StructuredDecodingManager:
 
         return (require_structured_out_cpu, grammar_bitmask_cpu,
                 structured_decode_arange)
+
+    def _prepare_spec_decode_input(
+        self, logits: jax.Array, grammar_output: "GrammarOutput",
+        scheduled_spec_decode_tokens: dict[str, list[int]]
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """Bitmask rows for spec decode, laid out like the logits.
+
+        With spec decode the logits hold 1 + num_draft rows per request, in
+        batch order (SpeculativeDecodingManager.get_spec_decode_metadata), and
+        the grammar bitmask holds `mask_stride` rows per structured request, in
+        `structured_output_request_ids` order. Same mapping as vLLM's
+        `apply_grammar_bitmask`.
+        """
+        grammar_bitmask = grammar_output.grammar_bitmask
+        assert grammar_bitmask is not None
+        assert self.runner.dp_size == 1, (
+            "structured decoding with spec decode needs dp_size 1")
+        num_rows, _ = logits.shape
+        struct_req_ids = list(grammar_output.structured_output_request_ids)
+
+        logit_index: dict[str, int] = {}
+        offset = 0
+        for batch_index, req_id in enumerate(
+                self.runner.input_batch.req_ids[:self.runner.input_batch.
+                                                num_reqs]):
+            logit_index[req_id] = batch_index + offset
+            offset += len(scheduled_spec_decode_tokens.get(req_id, ()))
+
+        bitmask_rows = np.zeros((num_rows, grammar_bitmask.shape[1]),
+                                dtype=np.int32)
+        require_rows = np.zeros((num_rows, 1), dtype=np.bool_)
+        mask_stride = grammar_bitmask.shape[0] // len(struct_req_ids)
+        for i, req_id in enumerate(struct_req_ids):
+            start = logit_index.get(req_id)
+            if start is None:
+                continue
+            n = 1 + len(scheduled_spec_decode_tokens.get(req_id, ()))
+            src = i * mask_stride
+            bitmask_rows[start:start + n] = grammar_bitmask[src:src + n]
+            require_rows[start:start + n] = True
+
+        return device_array(
+            self.runner.mesh,
+            (require_rows, bitmask_rows, self.runner.structured_decode_arange))

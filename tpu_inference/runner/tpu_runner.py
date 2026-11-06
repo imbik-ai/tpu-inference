@@ -1537,7 +1537,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 (
                     require_struct_decoding, grammar_bitmask_padded, arange
                 ) = self.structured_decoding_manager.prepare_structured_decoding_input(
-                    logits, grammar_output)
+                    logits, grammar_output,
+                    scheduler_output.scheduled_spec_decode_tokens
+                    if spec_decode_metadata is not None else None)
                 logits = self.structured_decoding_manager.structured_decode_fn(
                     require_struct_decoding,
                     grammar_bitmask_padded,
