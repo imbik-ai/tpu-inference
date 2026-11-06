@@ -24,7 +24,8 @@ import numpy as np
 import pytest
 
 from tpu_inference.layers.jax.sample.rejection_sampler import (
-    GREEDY_TEMPERATURE, PLACEHOLDER_TOKEN_ID, RejectionSampler)
+    GREEDY_TEMPERATURE, PLACEHOLDER_TOKEN_ID, RejectionSampler,
+    _mask_top_k_top_p_candidates, _mask_top_k_top_p_full_vocab)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 
@@ -1691,3 +1692,28 @@ class TestTopKTopPSampling:
             assert len(seq_tokens) >= 0  # Should have at least empty list
             for token_id in seq_tokens:
                 assert 0 <= token_id < vocab_size  # Valid token range
+
+
+class TestTopKTopPCandidateMask:
+    """The candidate mask must match the full-vocab binary-search mask."""
+
+    @pytest.mark.parametrize("coarse", [False, True])
+    def test_candidate_mask_matches_full_vocab(self, coarse):
+        vocab_size = 4096
+        top_k = jnp.array([1, 5, 20, 64, 20, 20, 0, -1, 7, 64, 3, 20],
+                          dtype=jnp.int32)
+        top_p = jnp.array(
+            [1.0, 1.0, 0.95, 0.9, 0.5, 0.01, 1.0, 1.0, 0.999, 1.0, 0.7, 0.95],
+            dtype=jnp.float32)
+        logits = 3 * jax.random.normal(jax.random.PRNGKey(0),
+                                       (top_k.shape[0], vocab_size))
+        if coarse:
+            # Many ties at the top-k and top-p cutoffs.
+            logits = jnp.round(logits)
+
+        expected = _mask_top_k_top_p_full_vocab(logits, top_k, top_p)
+        actual = _mask_top_k_top_p_candidates(logits, top_k, top_p)
+
+        np.testing.assert_array_equal(np.isfinite(actual),
+                                      np.isfinite(expected))
+        np.testing.assert_array_equal(actual, expected)

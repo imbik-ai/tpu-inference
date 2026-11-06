@@ -27,6 +27,8 @@ from jax.sharding import PartitionSpec
 
 from tpu_inference.layers.common.binary_search import topk_mask, topp_mask
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.jax.sample.sampling import (
+    _distributed_sampling_max_top_k, _shard_topk_candidates)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 
@@ -297,17 +299,16 @@ def _compute_probs(
     top_p = sampling_metadata.top_p[segment_ids]
     temperatures = sampling_metadata.temperature[segment_ids]
 
-    # Apply top-k and top-p masking
     logits = logits.astype(jnp.float32)
-    # Only apply top-k masking if k > 0 for each token
-    should_apply_topk = jnp.expand_dims(top_k > 0, axis=-1)
-    topk_masked = topk_mask(logits, top_k, replace_val=-jnp.inf)
-    logits = jnp.where(should_apply_topk, topk_masked, logits)
-
-    # Only apply top-p masking if p < 1.0 for each token
-    should_apply_topp = jnp.expand_dims(top_p < 1.0, axis=-1)
-    topp_masked = topp_mask(logits, top_p, replace_val=-jnp.inf)
-    logits = jnp.where(should_apply_topp, topp_masked, logits)
+    max_top_k = _distributed_sampling_max_top_k()
+    if logits.shape[-1] < max_top_k:
+        logits = _mask_top_k_top_p_full_vocab(logits, top_k, top_p)
+    else:
+        use_candidates = jnp.all(((top_k > 0) & (top_k <= max_top_k))
+                                 | ((top_k <= 0) & (top_p >= 1.0)))
+        logits = jax.lax.cond(use_candidates, _mask_top_k_top_p_candidates,
+                              _mask_top_k_top_p_full_vocab, logits, top_k,
+                              top_p)
 
     # Greedy requests in a sampling batch carry GREEDY_TEMPERATURE (InputBatch
     # stores -1.0 for them). Dividing by it would negate their logits and make
@@ -325,6 +326,54 @@ def _compute_probs(
     logits /= jnp.where(is_greedy, 1.0, temperatures + 1e-9)
 
     return jnp.where(is_greedy, greedy_probs, jax.nn.softmax(logits, axis=-1))
+
+
+def _mask_top_k_top_p_full_vocab(logits: jax.Array, top_k: jax.Array,
+                                 top_p: jax.Array) -> jax.Array:
+    # Only apply top-k masking if k > 0 for each token
+    should_apply_topk = jnp.expand_dims(top_k > 0, axis=-1)
+    topk_masked = topk_mask(logits, top_k, replace_val=-jnp.inf)
+    logits = jnp.where(should_apply_topk, topk_masked, logits)
+
+    # Only apply top-p masking if p < 1.0 for each token
+    should_apply_topp = jnp.expand_dims(top_p < 1.0, axis=-1)
+    topp_masked = topp_mask(logits, top_p, replace_val=-jnp.inf)
+    return jnp.where(should_apply_topp, topp_masked, logits)
+
+
+def _mask_top_k_top_p_candidates(logits: jax.Array, top_k: jax.Array,
+                                 top_p: jax.Array) -> jax.Array:
+    """Same mask as `_mask_top_k_top_p_full_vocab` for rows with top-k in
+    (0, DISTRIBUTED_SAMPLING_MAX_TOP_K] or no top-k and no top-p.
+
+    The full-vocab masks run a 32-step binary search each, so 65 passes over
+    the logits. Here both cutoffs come from each row's top max_top_k
+    candidates, plus two passes over the logits: one for the softmax sum of
+    the top-k set and one to apply the cutoff.
+    """
+    max_top_k = _distributed_sampling_max_top_k()
+    values, _ = _shard_topk_candidates(logits, max_top_k)
+    kth = jnp.take_along_axis(values,
+                              jnp.clip(top_k - 1, 0, max_top_k - 1)[:, None],
+                              axis=-1)
+    # Ties at kth stay in the top-k set and can fall outside the candidates,
+    # so the softmax sum runs over the logits, not over `values`.
+    row_max = values[:, :1]
+    total = jnp.sum(jnp.where(logits >= kth, jnp.exp(logits - row_max), 0.0),
+                    axis=-1,
+                    keepdims=True)
+    probs = jnp.where(values >= kth, jnp.exp(values - row_max), 0.0) / total
+    # `values` is in descending order, so the top-p set is a prefix of it. A
+    # set that does not close inside the candidates ends in kth ties.
+    cumulative = jnp.cumsum(probs, axis=-1)
+    cutoff = jnp.sum(cumulative < top_p[:, None], axis=-1, keepdims=True)
+    topp = jnp.take_along_axis(values,
+                               jnp.minimum(cutoff, max_top_k - 1),
+                               axis=-1)
+    topp = jnp.where(cutoff < max_top_k, topp, kth)
+    threshold = jnp.where((top_p < 1.0)[:, None], jnp.maximum(kth, topp), kth)
+    threshold = jnp.where((top_k > 0)[:, None], threshold, -jnp.inf)
+    return jnp.where(logits >= threshold, logits, -jnp.inf)
 
 
 def _get_segment_info(num_draft_tokens: jax.Array, total_tokens: int):
