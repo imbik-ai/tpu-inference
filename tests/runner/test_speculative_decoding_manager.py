@@ -224,6 +224,37 @@ class TestSpeculativeDecodingManager:
             del tokens[2:]
         assert result.draft_token_ids == [[10, 11], [20, 21]]
 
+    def test_take_draft_token_ids_uses_req_ids_from_propose_time(self):
+        """With async scheduling the next step can change the batch before the
+        scheduler takes the drafts; they must stay paired with the request ids
+        of the batch they were proposed for."""
+        self.runner.drafter = MagicMock(spec=Eagle3Proposer)
+        self.runner.speculative_config.method = "eagle3"
+        self.runner.input_batch = MagicMock(req_ids=["req-a", "req-b"])
+        metadata = MagicMock()
+        metadata.req_indices_dp = None
+        with patch.object(self.runner.speculative_decoding_manager,
+                          'propose_eagle3_draft_token_ids',
+                          return_value=[[10, 11], [20, 21]]):
+            self.runner.speculative_decoding_manager.propose_draft_token_ids(
+                sampled_output=MagicMock(),
+                logits_indices_selector=MagicMock(),
+                last_sampled_token_id=MagicMock(),
+                num_rejected_tokens=MagicMock(),
+                discard_sampled_tokens_req_indices=[],
+                aux_hidden_states=None,
+                attn_metadata=MagicMock(),
+                async_scheduling=False,
+                spec_decode_metadata=metadata,
+                input_ids=MagicMock(),
+            )
+        self.runner.input_batch = MagicMock(req_ids=["req-b", "req-c"])
+
+        result = self.runner.take_draft_token_ids()
+
+        assert result.req_ids == ["req-a", "req-b"]
+        assert result.draft_token_ids == [[10, 11], [20, 21]]
+
     def _setup_spec_decode_metadata_test(self):
         """Helper method to set up common test infrastructure for spec decode metadata tests."""
         # Mock runner attributes needed by the function

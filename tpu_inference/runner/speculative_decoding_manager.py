@@ -42,12 +42,17 @@ class SpeculativeDecodingManager:
         self.runner = runner
         # Cached draft tokens.
         self._draft_token_ids: Optional[list[list[int]]] = None
+        # Request ids of the batch the drafts were proposed for. The batch can
+        # change before the scheduler takes the drafts (as in vLLM's GPU runner).
+        self._draft_token_req_ids: Optional[list[Optional[str]]] = None
         self._req_indices_dp: Optional[dict] = None
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         if self._draft_token_ids is None:
             return None
-        req_ids = self.runner.input_batch.req_ids
+        req_ids = (self._draft_token_req_ids if self._draft_token_req_ids
+                   is not None else self.runner.input_batch.req_ids)
+        self._draft_token_req_ids = None
         draft_token_ids = self._draft_token_ids
         if not isinstance(draft_token_ids, list):
             # Async scheduling keeps the drafts on device. The scheduler edits
@@ -91,6 +96,7 @@ class SpeculativeDecodingManager:
         if async_scheduling:
             assert self.runner.speculative_config.use_eagle(
             ), "async scheduling is only supported with eagle3 spec decoding"
+        self._draft_token_req_ids = list(self.runner.input_batch.req_ids)
         if self.runner.speculative_config.method == "ngram":
             assert isinstance(self.runner.drafter, NgramProposer)
             # For n-gram based proposer, the drafter run on host
