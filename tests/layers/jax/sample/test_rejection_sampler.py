@@ -1750,26 +1750,54 @@ class TestTopKTopPCandidateMask:
         np.testing.assert_array_equal(actual, expected)
 
     def test_candidate_mask_keeps_top_k_when_top_p_rounds(self):
-        # The top-k mass can sum to less than a top_p this close to 1, so the
-        # top-p cutoff runs off the end of the candidates.
-        vocab_size = 4096
-        logits = 3 * jax.random.normal(jax.random.PRNGKey(1), (4, vocab_size))
-        top_k = jnp.array([5, 20, 5, 20], dtype=jnp.int32)
-        top_p = jnp.array([1 - 2**-24, 1 - 2**-24, 1 - 2**-23, 1 - 2**-23],
-                          dtype=jnp.float32)
+        # In float32 the top-k mass can sum to just under 1, so a top_p
+        # between that sum and 1 is never reached inside the candidates. Build
+        # such rows the way the mask sums them; whether a row qualifies
+        # depends on the backend's rounding, so the test fails loudly if none
+        # does.
+        vocab_size, max_top_k = 4096, 64
+        rows, top_k, top_p = [], [], []
+        for seed in range(64):
+            row = 3 * jax.random.normal(jax.random.PRNGKey(seed),
+                                        (1, vocab_size))
+            values, _ = jax.lax.top_k(row, max_top_k)
+            for k in (5, 20):
+                kth = values[:, k - 1:k]
+                total = jnp.sum(jnp.where(row >= kth,
+                                          jnp.exp(row - values[:, :1]), 0.0),
+                                axis=-1,
+                                keepdims=True)
+                probs = jnp.where(values >= kth,
+                                  jnp.exp(values - values[:, :1]), 0.0) / total
+                mass = jnp.cumsum(probs, axis=-1)[0, -1]
+                p = np.nextafter(np.float32(mass), np.float32(2))
+                if p < 1.0:
+                    rows.append(row[0])
+                    top_k.append(k)
+                    top_p.append(p)
+        assert rows, "no row whose top-k mass rounds below 1 on this backend"
+        top_k = jnp.array(top_k, dtype=jnp.int32)
 
-        actual = _mask_top_k_top_p_candidates(logits, top_k, top_p)
+        actual = _mask_top_k_top_p_candidates(
+            jnp.stack(rows), top_k, jnp.array(top_p, dtype=jnp.float32))
 
         np.testing.assert_array_equal(
             np.isfinite(actual).sum(axis=-1), np.asarray(top_k))
 
-    def test_compute_probs_mixed_batch(self):
-        # Rows the candidate mask does not cover (top-p only, top_k above
-        # DISTRIBUTED_SAMPLING_MAX_TOP_K) send the batch to the full-vocab
-        # masks.
+    @pytest.mark.parametrize(
+        "top_k,top_p",
+        [
+            # Every row is covered: the candidate branch runs under jit.
+            ([20, 5, 0, 64], [0.95, 1.0, 1.0, 0.9]),
+            # Only top_k above DISTRIBUTED_SAMPLING_MAX_TOP_K is uncovered.
+            ([20, 100, 0, 64], [0.95, 1.0, 1.0, 0.9]),
+            # Only a top-p row with no top-k is uncovered.
+            ([20, -1, 0, 64], [0.95, 0.5, 1.0, 0.9]),
+        ])
+    def test_compute_probs_batch(self, top_k, top_p):
         vocab_size = 4096
-        top_k = jnp.array([20, -1, 100, 0], dtype=jnp.int32)
-        top_p = jnp.array([0.95, 0.5, 0.9, 1.0], dtype=jnp.float32)
+        top_k = jnp.array(top_k, dtype=jnp.int32)
+        top_p = jnp.array(top_p, dtype=jnp.float32)
         logits = 3 * jax.random.normal(jax.random.PRNGKey(2),
                                        (top_k.shape[0], vocab_size))
         metadata = TPUSupportedSamplingMetadata(do_sampling=True,
