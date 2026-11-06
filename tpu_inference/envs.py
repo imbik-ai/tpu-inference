@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     BF16_LINEAR_REQUANTIZE_PATTERNS: list[str] = []
     BF16_LINEAR_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     BF16_LINEAR_REQUANTIZE_BLOCK_SIZE: int | None = None
+    BF16_LINEAR_REQUANTIZE_QUANTIZE_ACTIVATION: bool = True
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = ""
     MOE_REQUANTIZE_CLIP_PERCENTILE: float | None = None
@@ -351,6 +352,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "BF16_LINEAR_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if
     (block_size := os.getenv("BF16_LINEAR_REQUANTIZE_BLOCK_SIZE")) else None,
+    # False keeps the activations of the requantized linears in bf16 (weight-only
+    # int8/fp8): the weight reads still halve, the activation rounding goes away.
+    "BF16_LINEAR_REQUANTIZE_QUANTIZE_ACTIVATION":
+    env_bool("BF16_LINEAR_REQUANTIZE_QUANTIZE_ACTIVATION", default=True),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE":
     lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", ""),

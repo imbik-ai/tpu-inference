@@ -556,6 +556,7 @@ class VllmQuantizedBf16LinearMethod(common_fp8.Fp8LinearMethod,
         self.weight_dtype = to_jax_dtype(
             envs.BF16_LINEAR_REQUANTIZE_WEIGHT_DTYPE)
         self.block_size = envs.BF16_LINEAR_REQUANTIZE_BLOCK_SIZE
+        self.quantize_activation = envs.BF16_LINEAR_REQUANTIZE_QUANTIZE_ACTIVATION
         logger.info_once(
             "BF16_LINEAR_REQUANTIZE_PATTERNS selected the unquantized linear "
             "layers matching %s; quantizing them to %s (%s).",

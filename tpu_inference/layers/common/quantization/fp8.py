@@ -40,6 +40,8 @@ class Fp8LinearMethod:
     This class will be shared in both vLLM and jax path.
     """
 
+    quantize_activation: bool = True
+
     def __init__(self, linear_config: QuantLinearConfig):
         self.linear_config = linear_config
 
@@ -54,7 +56,8 @@ class Fp8LinearMethod:
             self.linear_config.weight_sharding,
             mesh=self.linear_config.mesh,
             defer_all_reduce=self.linear_config.defer_all_reduce,
-            sp_token_axes=self.linear_config.get_sp_token_axes(x))
+            sp_token_axes=self.linear_config.get_sp_token_axes(x),
+            maybe_quantize_x=self.quantize_activation)
 
         if bias is not None:
             outs += bias
@@ -78,7 +81,8 @@ class Fp8LinearMethod:
                 self.linear_config.weight_sharding,
                 mesh=mesh,
                 defer_all_reduce=self.linear_config.defer_all_reduce,
-                sp_token_axes=self.linear_config.get_sp_token_axes(x))
+                sp_token_axes=self.linear_config.get_sp_token_axes(x),
+                maybe_quantize_x=self.quantize_activation)
 
             if bias is not None:
                 out += bias[i]
