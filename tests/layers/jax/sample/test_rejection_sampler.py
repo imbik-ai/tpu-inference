@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 
 from tpu_inference.layers.jax.sample.rejection_sampler import (
-    PLACEHOLDER_TOKEN_ID, RejectionSampler)
+    GREEDY_TEMPERATURE, PLACEHOLDER_TOKEN_ID, RejectionSampler)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 
@@ -928,6 +928,44 @@ class TestNonGreedyRejectionSampler:
         for i in range(1, len(outputs)):
             assert outputs[i] == outputs[
                 0], f"Run {i}: {outputs[i]} != {outputs[0]}"
+
+    def test_greedy_request_in_sampling_batch(self, rejection_sampler,
+                                              test_helper):
+        """A greedy request (temperature GREEDY_TEMPERATURE, as InputBatch
+        stores it) in a batch that also samples keeps argmax verification."""
+        metadata = TPUSupportedSamplingMetadata(
+            do_sampling=True,
+            logprobs=False,
+            top_k=jnp.array([-1, -1], dtype=jnp.int32),
+            top_p=jnp.array([1.0, 1.0], dtype=jnp.float32),
+            temperature=jnp.array([GREEDY_TEMPERATURE, 1.0],
+                                  dtype=jnp.float32),
+        )
+        # Request 0 (greedy): draft 15 matches, draft 25 does not (target 35).
+        # Request 1 (sampled): both drafts match.
+        draft_token_ids = jnp.array([15, 25, 5, 6], dtype=jnp.int32)
+        target_logits = test_helper.create_target_logits_from_tokens(
+            [15, 35, 5, 6], VOCAB_SIZE)
+        num_draft_tokens = jnp.array([2, 2], dtype=jnp.int32)
+
+        output = rejection_sampler(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens,
+            draft_probs=None,
+            target_logits=target_logits,
+            bonus_token_ids=jnp.array([88, 99], dtype=jnp.int32),
+            sampling_metadata=metadata,
+            key=jax.random.PRNGKey(0),
+        )
+        parsed_output = rejection_sampler.parse_output(
+            output,
+            VOCAB_SIZE,
+            num_draft_tokens_cpu=np.asarray(num_draft_tokens),
+            batch_size=2,
+            padded_tokens_length=4)
+
+        assert parsed_output[0] == [15, 35]
+        assert parsed_output[1] == [5, 6, 99]
 
     def test_non_greedy_with_draft_probs_none(self, rejection_sampler,
                                               test_helper):

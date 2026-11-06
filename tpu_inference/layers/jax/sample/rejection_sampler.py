@@ -309,12 +309,21 @@ def _compute_probs(
     topp_masked = topp_mask(logits, top_p, replace_val=-jnp.inf)
     logits = jnp.where(should_apply_topp, topp_masked, logits)
 
+    # Greedy requests in a sampling batch carry GREEDY_TEMPERATURE (InputBatch
+    # stores -1.0 for them). Dividing by it would negate their logits and make
+    # the verify step pick the least likely tokens, so they get a one-hot
+    # target at the argmax instead, as in vLLM's GPU rejection sampler.
+    is_greedy = jnp.expand_dims(temperatures == GREEDY_TEMPERATURE, axis=-1)
+    greedy_probs = jax.nn.one_hot(jnp.argmax(logits, axis=-1),
+                                  logits.shape[-1],
+                                  dtype=logits.dtype)
+
     # Apply temperature scaling
     temperatures = jnp.expand_dims(temperatures, axis=-1)
     # Add epsilon to avoid division by zero
-    logits /= (temperatures + 1e-9)
+    logits /= jnp.where(is_greedy, 1.0, temperatures + 1e-9)
 
-    return jax.nn.softmax(logits, axis=-1)
+    return jnp.where(is_greedy, greedy_probs, jax.nn.softmax(logits, axis=-1))
 
 
 def _get_segment_info(num_draft_tokens: jax.Array, total_tokens: int):
