@@ -15,6 +15,7 @@
 from unittest.mock import MagicMock, patch
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
@@ -208,6 +209,20 @@ class TestSpeculativeDecodingManager:
         # Case 3: Call again after taking, should return None
         result_after = self.runner.take_draft_token_ids()
         assert result_after is None
+
+    def test_take_draft_token_ids_device_array_gives_lists(self):
+        """Async scheduling keeps drafts on device; the scheduler trims them
+        in place (`del spec_token_ids[n:]`), so they must come back as lists."""
+        self.runner.speculative_decoding_manager._draft_token_ids = jnp.array(
+            [[10, 11, 12], [20, 21, 22]], dtype=jnp.int32)
+        self.runner.speculative_decoding_manager._req_indices_dp = None
+
+        result = self.runner.take_draft_token_ids()
+
+        assert result.draft_token_ids == [[10, 11, 12], [20, 21, 22]]
+        for tokens in result.draft_token_ids:
+            del tokens[2:]
+        assert result.draft_token_ids == [[10, 11], [20, 21]]
 
     def _setup_spec_decode_metadata_test(self):
         """Helper method to set up common test infrastructure for spec decode metadata tests."""
