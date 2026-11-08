@@ -1034,7 +1034,17 @@ class KVCacheManager:
                         zip(layer_spec.shapes, layer_spec.dtypes)):
                     jax_dtype = t2j_dtype(dtype)
                     cache_shape = (num_blocks, *shape)
-                    if state_index == 0:
+                    if state_index == 0 and tpu_envs.GDN_CONV_STATE_KERNEL_LAYOUT:
+                        # conv_state: [num_blocks, conv_kernel_size - 1, 1, dim]
+                        spec_config = self.runner.speculative_config
+                        num_spec = (spec_config.num_speculative_tokens
+                                    if spec_config else 0)
+                        cache_shape = (num_blocks, shape[0] - num_spec, 1,
+                                       shape[1])
+                        jax_dtype = jnp.float32
+                        spec = PartitionSpec(ShardingAxisName.ATTN_DATA, None,
+                                             None, ShardingAxisName.ATTN_HEAD)
+                    elif state_index == 0:
                         # conv_state: [num_blocks, conv_kernel_size, intermediate_size]
                         spec = PartitionSpec(ShardingAxisName.ATTN_DATA, None,
                                              ShardingAxisName.ATTN_HEAD)

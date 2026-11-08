@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     BF16_LINEAR_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     BF16_LINEAR_REQUANTIZE_BLOCK_SIZE: int | None = None
     BF16_LINEAR_REQUANTIZE_QUANTIZE_ACTIVATION: bool = True
+    GDN_CONV_STATE_KERNEL_LAYOUT: bool = False
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = ""
     MOE_REQUANTIZE_CLIP_PERCENTILE: float | None = None
@@ -356,6 +357,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # int8/fp8): the weight reads still halve, the activation rounding goes away.
     "BF16_LINEAR_REQUANTIZE_QUANTIZE_ACTIVATION":
     env_bool("BF16_LINEAR_REQUANTIZE_QUANTIZE_ACTIVATION", default=True),
+    # True stores the GDN conv state as f32 [blocks, kernel_size - 1, 1, dim],
+    # the fused conv1d+GDN kernel's own layout, so the kernel updates it in
+    # place instead of every layer slicing, casting and re-laying out the
+    # whole cache on every step. The positions vLLM adds for speculative
+    # tokens are dropped: the kernel keeps per-window checkpoints in slots.
+    "GDN_CONV_STATE_KERNEL_LAYOUT":
+    env_bool("GDN_CONV_STATE_KERNEL_LAYOUT", default=False),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE":
     lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", ""),

@@ -107,13 +107,14 @@ def run_jax_gdn_attention(
     if read_state_indices is None:
         read_state_indices = state_indices
 
+    conv_spec = P(ShardingAxisName.ATTN_DATA, *[None] * (conv_state.ndim - 2),
+                  ShardingAxisName.ATTN_HEAD)
     in_specs = (
         P(ShardingAxisName.ATTN_DATA,
           ShardingAxisName.ATTN_HEAD),  # j_mixed_qkv
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_b
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_a
-        P(ShardingAxisName.ATTN_DATA, None,
-          ShardingAxisName.ATTN_HEAD),  # conv_state
+        conv_spec,  # conv_state
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None,
           None),  # recurrent_state
         P(ShardingAxisName.ATTN_HEAD, None, None),  # j_conv_weight
@@ -135,8 +136,7 @@ def run_jax_gdn_attention(
 
     out_specs = (
         (
-            P(ShardingAxisName.ATTN_DATA, None,
-              ShardingAxisName.ATTN_HEAD),  # new_conv_state
+            conv_spec,  # new_conv_state
             P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None,
               None),  # new_recurrent_state
         ),
@@ -293,7 +293,8 @@ def copy_gdn_state_slots(
     with the batch size. Sources and destinations must not overlap.
     """
     state_specs = (
-        P(ShardingAxisName.ATTN_DATA, None, ShardingAxisName.ATTN_HEAD),
+        P(ShardingAxisName.ATTN_DATA, *[None] * (conv_state.ndim - 2),
+          ShardingAxisName.ATTN_HEAD),
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None, None),
     )
 
