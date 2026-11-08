@@ -19,6 +19,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from tpu_inference import envs as tpu_envs
 from tpu_inference.kernels.gdn.v3 import (compute_conv1d, compute_gdn, config,
                                           memory_ref, metadata, vmem_ldst)
 
@@ -101,7 +102,11 @@ def inner_kernel(
         cfg=cfg,
     )
 
-    conv_state_slot_ref[...] = new_conv_state
+    if tpu_envs.GDN_CONV_STATE_BF16_ROUND:
+        conv_state_slot_ref[...] = new_conv_state.astype(jnp.bfloat16).astype(
+            new_conv_state.dtype)
+    else:
+        conv_state_slot_ref[...] = new_conv_state
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.

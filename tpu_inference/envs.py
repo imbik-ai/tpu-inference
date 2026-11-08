@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     BF16_LINEAR_REQUANTIZE_BLOCK_SIZE: int | None = None
     BF16_LINEAR_REQUANTIZE_QUANTIZE_ACTIVATION: bool = True
     GDN_CONV_STATE_KERNEL_LAYOUT: bool = False
+    GDN_CONV_STATE_BF16_ROUND: bool = False
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = ""
     MOE_REQUANTIZE_CLIP_PERCENTILE: float | None = None
@@ -364,6 +365,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tokens are dropped: the kernel keeps per-window checkpoints in slots.
     "GDN_CONV_STATE_KERNEL_LAYOUT":
     env_bool("GDN_CONV_STATE_KERNEL_LAYOUT", default=False),
+    # True rounds the GDN conv state to bf16 before the fused kernel stores
+    # it, so an f32 kernel-layout cache holds the same values as a bf16 cache.
+    "GDN_CONV_STATE_BF16_ROUND":
+    env_bool("GDN_CONV_STATE_BF16_ROUND", default=False),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE":
     lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", ""),
