@@ -33,6 +33,7 @@ and The HuggingFace Inc. team).
 """
 
 import math
+import os
 import types
 from collections.abc import Iterable
 
@@ -73,6 +74,12 @@ from tpu_inference.models.vllm.vllm_model_wrapper_context import \
 # Host copies of the PLE n-gram tables, in PLE layer order. The runner reads
 # them (same process) to gather embeddings before each step.
 HOST_NGRAM_TABLES: list = []
+
+# Steps with at most this many (padded) tokens use the sparse-gather QSA path.
+# Off by default: in plain XLA on v6e its per-token gathers are slower than
+# the dense masked path at 8K context (needs a Pallas DMA kernel).
+_QSA_SPARSE_MAX_TOKENS = int(os.environ.get("QWEN4EXP_QSA_SPARSE_MAX_TOKENS",
+                                            "0"))
 
 # HF configs name QSA layers "full_attention" (raw) or "indexed_attention".
 _QSA_LAYER_TYPES = ("full_attention", "indexed_attention",
@@ -432,6 +439,7 @@ class Qwen4ExpQSAAttention(nn.Module):
             compress_ratio=self.compress_ratio,
             budget=self.budget,
             scale=self.scaling,
+            sparse_max_tokens=_QSA_SPARSE_MAX_TOKENS,
         )
         ctx.kv_caches[cache_idx] = new_cache
         out = torch_view(out).reshape(T, -1) * torch.sigmoid(gate)
