@@ -19,6 +19,12 @@
 _TPU_VLLM_MODELS = {
     "DeepseekV4ForCausalLM":
     "tpu_inference.models.vllm.experimental.deepseek_v4:DeepseekV4ForCausalLM",
+    # Qwen3.8 Flash-Next. vLLM's own qwen4_exp package is CUDA/ROCm only.
+    "Qwen4ExpForCausalLM":
+    "tpu_inference.models.vllm.experimental.qwen4_exp:Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration":
+    "tpu_inference.models.vllm.experimental.qwen4_exp:"
+    "Qwen4ExpForConditionalGeneration",
 }
 
 

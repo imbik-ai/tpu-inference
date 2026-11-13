@@ -63,6 +63,7 @@ class PCPMetadata:
     data_fields=[
         "state_indices",
         "read_offsets",
+        "ple_embeddings",
     ],
     meta_fields=[],
 )
@@ -82,6 +83,10 @@ class MambaMetadata:
     # from the previous speculative verification step to read from.
     # None when speculative decoding or mamba/GDN state is disabled.
     read_offsets: jax.Array | None = None
+    # (padded_total_num_scheduled_tokens, ple_embed_dim) — Qwen4Exp PLE
+    # n-gram embeddings per scheduled token, hashed and gathered on the host
+    # from the request's token history. None for models without PLE.
+    ple_embeddings: jax.Array | None = None
 
 
 @functools.partial(
