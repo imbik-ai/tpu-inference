@@ -703,6 +703,7 @@ def process_quantized_moe_weights(
     desired_quant_dtype: jnp.dtype | None = None,
     requant_block_size: int | None = None,
     source_mesh: Mesh | None = None,
+    disable_weight_requantization: bool | None = None,
 ) -> FusedMoEWeights:
     """Process quantized MoE weights for inference.
 
@@ -719,6 +720,8 @@ def process_quantized_moe_weights(
         desired_quant_dtype: Optional desired data type for requantization.
         requant_block_size: Optional block size for requantization.
         source_mesh: Optional mesh where weights currently reside.
+        disable_weight_requantization: Keep the checkpoint's quantization
+            as is. None: use DISABLE_WEIGHT_REQUANTIZATION.
 
     Returns:
         The processed FusedMoEWeights.
@@ -726,7 +729,8 @@ def process_quantized_moe_weights(
 
     weights = shard_moe_weights_to_tpu(weights, mesh, source_mesh)
 
-    disable_weight_requantization = envs.DISABLE_WEIGHT_REQUANTIZATION
+    if disable_weight_requantization is None:
+        disable_weight_requantization = envs.DISABLE_WEIGHT_REQUANTIZATION
 
     if desired_quant_dtype is None:
         if desired_quant_dtype_from_env := envs.MOE_REQUANTIZE_WEIGHT_DTYPE:
