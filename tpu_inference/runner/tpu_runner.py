@@ -3336,9 +3336,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     "async scheduling is not supported yet")
             from tpu_inference.models.vllm.experimental.qwen4_exp import \
                 HOST_NGRAM_TABLES
-            table = HOST_NGRAM_TABLES[0]
-            emb = table[ple_ngram_ids_cpu].reshape(
-                ple_ngram_ids_cpu.shape[0], -1)
+            emb = HOST_NGRAM_TABLES[0].gather(ple_ngram_ids_cpu)
             ple_embeddings = device_array(self.mesh,
                                           emb,
                                           sharding=data_parallel_attn_sharding)

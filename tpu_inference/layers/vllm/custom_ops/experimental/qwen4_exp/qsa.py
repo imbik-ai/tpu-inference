@@ -25,13 +25,15 @@ the TPU KV cache manager from an `Attention` spec with `num_kv_heads + 1`
 heads, rounded up to a power of two so TP can shard or replicate it).
 Combined rows (k0, v0, k1, v1, ..., idx, unused...) per token: row
 2h / 2h+1 hold K / V of KV head h, row 2*num_kv_heads holds the raw index key
-(zero padded to the head dim). Pooled keys are recomputed from the raw keys
-on every step instead of being cached.
+(zero padded to the head dim). Row 2*num_kv_heads+1 of a group's last token
+holds the group's compressed key (pooled, normed, RoPE'd), written when the
+group completes; there is no separate compressor ring.
 
-Compute. For each (padded) request the op gathers the request's whole paged
-history and runs a dense masked attention for the batch's tokens of that
-request. Cost is O(tokens x max_model_len) per request; a sparse gather
-kernel is the follow-up.
+Compute. Small steps (decode) gather, per query, the compressed keys of its
+request, pick the top groups, and attend over the selected tokens plus the
+tail only. Large steps (prefill) run a dense masked attention per request
+over its whole paged history, O(tokens x max_model_len). Plain JAX gathers;
+a Pallas kernel is the follow-up.
 """
 
 import math
@@ -76,6 +78,77 @@ def token_request_map(query_start_loc: jax.Array, num_reqs: jax.Array,
     return req, t < total
 
 
+def _qsa_write_and_compress(q, k, v, idx_q, idx_k, kv_cache, positions, bt,
+                            req, valid, idx_k_norm_weight, inv_freq, *, eps,
+                            compress_ratio):
+    """RoPE, then write K/V/raw index keys; write the compressed key of every
+    group this step completes at its last token's slot."""
+    T, _, D = q.shape
+    Hkv = k.shape[1]
+    Di = idx_k.shape[-1]
+    N, bs, A, P, Dc = kv_cache.shape
+    C = A * P
+    R = compress_ratio
+    ck_row = 2 * Hkv + 1
+    assert C >= ck_row + 1 and Dc >= max(D, Di)
+    dtype = kv_cache.dtype
+    pages_per_req = bt.shape[1]
+
+    q = rope_neox(q, positions, inv_freq)
+    k = rope_neox(k, positions, inv_freq)
+    idx_q = rope_neox(idx_q, positions, inv_freq)
+
+    def pad_d(x):
+        return jnp.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, Dc - x.shape[-1])])
+
+    kv = jnp.stack([k, v], axis=2).reshape(T, 2 * Hkv, D)
+    rows = jnp.concatenate([
+        pad_d(kv).astype(dtype),
+        pad_d(idx_k)[:, None, :].astype(dtype),
+        jnp.zeros((T, C - 2 * Hkv - 1, Dc), dtype),
+    ],
+                           axis=1)
+    # Index the cache in its native 5-D shape: reshaping the whole cache
+    # changes its TPU tiling and costs full copies.
+    page = bt[req, jnp.clip(positions // bs, 0, pages_per_req - 1)]
+    page = jnp.where(valid, page, N)  # out of range -> dropped
+    off = positions % bs
+    kv_cache = kv_cache.at[page, off].set(rows.reshape(T, A, P, Dc),
+                                          mode="drop")
+
+    # Compressed keys: mean of the group's raw keys, k-norm, RoPE at the
+    # group's first position. Stored in row ck_row of the group's last token.
+    done = valid & ((positions + 1) % R == 0)
+    gpos = positions[:, None] - (R - 1) + jnp.arange(R, dtype=jnp.int32)
+    gpos = jnp.maximum(gpos, 0)
+    gpage = bt[req[:, None], jnp.clip(gpos // bs, 0, pages_per_req - 1)]
+    a_i, p_i = divmod(2 * Hkv, P)
+    raw = kv_cache[gpage, gpos % bs, a_i, p_i, :Di]  # (T, R, Di)
+    pooled = raw.astype(jnp.float32).mean(axis=1).astype(dtype)
+    pooled = gemma_rms_norm(pooled, idx_k_norm_weight, eps)
+    ck = rope_neox(pooled[:, None, :], gpos[:, 0], inv_freq)[:, 0, :]
+    a_c, p_c = divmod(ck_row, P)
+    kv_cache = kv_cache.at[jnp.where(done, page, N), off, a_c,
+                           p_c].set(pad_d(ck).astype(dtype), mode="drop")
+    return q, idx_q, kv_cache, (a_c, p_c)
+
+
+def _masked_softmax_attend(qg, keys, vals, mask, scale, dtype):
+    """qg (T,Hkv,G,D); keys/vals (T or 1, S, Hkv, D); mask (T,S)."""
+    logits = jnp.einsum("tkgd,tskd->tkgs",
+                        qg,
+                        keys,
+                        preferred_element_type=jnp.float32) * scale
+    logits = jnp.where(mask[:, None, None, :], logits, -jnp.inf)
+    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+    probs = jnp.exp(logits)
+    probs = probs / jnp.sum(probs, axis=-1, keepdims=True)
+    return jnp.einsum("tkgs,tskd->tkgd",
+                      probs.astype(dtype),
+                      vals,
+                      preferred_element_type=jnp.float32)
+
+
 def qsa_attention(
     q: jax.Array,  # (T, Hq, D), q_norm applied, no rope
     k: jax.Array,  # (T, Hkv, D), k_norm applied, no rope
@@ -96,100 +169,90 @@ def qsa_attention(
     compress_ratio: int,
     budget: int,
     scale: float,
+    sparse_max_tokens: int = 64,
 ):
+    """Steps with at most `sparse_max_tokens` (padded) tokens, i.e. decode,
+    gather only each query's selected keys; larger (prefill) steps run a
+    dense masked attention per request. Both read the cached compressed
+    keys and give the same result."""
     T, Hq, D = q.shape
     Hkv = k.shape[1]
     Di = idx_k.shape[-1]
     N, bs, A, P, Dc = kv_cache.shape
     C = A * P
-    assert C >= 2 * Hkv + 1 and Dc >= max(D, Di)
+    R = compress_ratio
     dtype = kv_cache.dtype
 
     positions = positions.astype(jnp.int32)
     req, valid = token_request_map(query_start_loc, num_reqs, T, max_reqs)
     bt = block_tables.reshape(max_reqs, -1)
     pages_per_req = bt.shape[1]
+    q, idx_q, kv_cache, (a_c, p_c) = _qsa_write_and_compress(
+        q, k, v, idx_q, idx_k, kv_cache, positions, bt, req, valid,
+        idx_k_norm_weight, inv_freq, eps=eps, compress_ratio=R)
 
-    # RoPE for the query/key paths at token positions.
-    q = rope_neox(q, positions, inv_freq)
-    k = rope_neox(k, positions, inv_freq)
-    idx_q = rope_neox(idx_q, positions, inv_freq)
-
-    # 1) Write this step's K, V and raw index keys into the paged cache.
-    def pad_d(x):
-        return jnp.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, Dc - x.shape[-1])])
-
-    kv = jnp.stack([k, v], axis=2).reshape(T, 2 * Hkv, D)
-    rows = jnp.concatenate([
-        pad_d(kv).astype(dtype),
-        pad_d(idx_k)[:, None, :].astype(dtype),
-        jnp.zeros((T, C - 2 * Hkv - 1, Dc), dtype),
-    ],
-                           axis=1)
-    # Index the cache in its native 5-D shape: reshaping the whole cache
-    # changes its TPU tiling and costs full copies.
-    page = bt[req, jnp.clip(positions // bs, 0, pages_per_req - 1)]
-    page = jnp.where(valid, page, N)  # out of range -> dropped
-    kv_cache = kv_cache.at[page, positions % bs].set(rows.reshape(
-        T, A, P, Dc),
-                                                     mode="drop")
-
-    # 2) Per request: selection + dense masked attention.
     L = pages_per_req * bs
-    NB = L // compress_ratio
-    block_topk = min(budget // compress_ratio, NB)
-    j = jnp.arange(L, dtype=jnp.int32)
-    blk_of_j = jnp.minimum(j // compress_ratio, NB - 1)
+    NB = L // R
+    block_topk = min(budget // R, NB)
     group = Hq // Hkv
     qg = q.reshape(T, Hkv, group, D)
-    nb_t = (positions + 1) // compress_ratio  # complete visible groups
+    nb_t = (positions + 1) // R  # complete visible groups
     bvalid = jnp.arange(NB, dtype=jnp.int32)[None, :] < nb_t[:, None]
-    tail = (j[None, :] >= nb_t[:, None] * compress_ratio) & (
-        j[None, :] <= positions[:, None])
-    group_pos = jnp.arange(NB, dtype=jnp.int32) * compress_ratio
-    out = jnp.zeros((T, Hq, D), dtype=q.dtype)
+    cpos = jnp.arange(NB, dtype=jnp.int32) * R + (R - 1)
 
+    def select(ckeys):  # ckeys (T or 1, NB, Di) -> (T, block_topk) group ids
+        scores = jnp.einsum("thd,tbd->thb",
+                            idx_q.astype(jnp.float32),
+                            ckeys.astype(jnp.float32),
+                            preferred_element_type=jnp.float32)
+        scores = jnp.maximum(scores, 0.0).sum(axis=1) / math.sqrt(Di)
+        scores = jnp.where(bvalid, scores, -jnp.inf)
+        vals, top_idx = jax.lax.top_k(scores, block_topk)
+        return top_idx, vals > -jnp.inf
+
+    if T <= sparse_max_tokens:
+        # Sparse: per query, the compressed keys of its request, then K/V of
+        # the selected groups plus the tail only.
+        cpage = bt[req][:, cpos // bs]  # (T, NB)
+        ckeys = kv_cache[cpage, (cpos % bs)[None, :], a_c, p_c, :Di]
+        top_idx, top_ok = select(ckeys)
+        sel_pos = (top_idx[:, :, None] * R +
+                   jnp.arange(R, dtype=jnp.int32)).reshape(T, -1)
+        sel_ok = jnp.repeat(top_ok, R, axis=1)
+        tail_pos = nb_t[:, None] * R + jnp.arange(R - 1, dtype=jnp.int32)
+        tail_ok = tail_pos <= positions[:, None]
+        all_pos = jnp.concatenate([sel_pos, tail_pos], axis=1)
+        ok = jnp.concatenate([sel_ok, tail_ok], axis=1)
+        all_pos = jnp.where(ok, all_pos, 0)
+        kpage = bt[req[:, None], jnp.clip(all_pos // bs, 0, pages_per_req - 1)]
+        kv = kv_cache[kpage, all_pos % bs, :Hkv]  # (T, S, Hkv, P, Dc)
+        keys = kv[:, :, :, 0, :D]
+        vals = kv[:, :, :, 1, :D]
+        out = _masked_softmax_attend(qg, keys, vals, ok, scale, dtype)
+        out = out.reshape(T, Hq, D).astype(q.dtype)
+        return jnp.where(valid[:, None, None], out, 0), kv_cache
+
+    j = jnp.arange(L, dtype=jnp.int32)
+    blk_of_j = jnp.minimum(j // R, NB - 1)
+    tail = (j[None, :] >= nb_t[:, None] * R) & (j[None, :] <= positions[:, None])
+    out = jnp.zeros((T, Hq, D), dtype=q.dtype)
     for r in range(padded_num_reqs):
         hist = kv_cache[bt[r]].reshape(L, C, Dc)  # (L, C, Dc)
         k_r = hist[:, 0:2 * Hkv:2, :D]  # (L, Hkv, D)
         v_r = hist[:, 1:2 * Hkv:2, :D]
-        ik_r = hist[:, 2 * Hkv, :Di]  # (L, Di)
-
-        pooled = ik_r[:NB * compress_ratio].reshape(
-            NB, compress_ratio, Di).astype(jnp.float32).mean(axis=1)
-        pooled = gemma_rms_norm(pooled.astype(dtype), idx_k_norm_weight, eps)
-        kc = rope_neox(pooled[:, None, :], group_pos, inv_freq)[:, 0, :]
-
-        scores = jnp.einsum("thd,bd->thb",
-                            idx_q.astype(jnp.float32),
-                            kc.astype(jnp.float32),
-                            preferred_element_type=jnp.float32)
-        scores = jnp.maximum(scores, 0.0).sum(axis=1) / math.sqrt(Di)
-        scores = jnp.where(bvalid, scores, -jnp.inf)
-        _, top_idx = jax.lax.top_k(scores, block_topk)
+        kc = hist[R - 1::R, a_c * P + p_c, :Di][:NB]  # (NB, Di)
+        top_idx, top_ok = select(kc[None])
         sel = jnp.zeros((T, NB), dtype=bool).at[jnp.arange(T)[:, None],
-                                                top_idx].set(True)
+                                                top_idx].set(top_ok)
         sel = sel & bvalid
         mask = jnp.take_along_axis(
             sel, jnp.broadcast_to(blk_of_j[None, :], (T, L)), axis=1)
-        mask = (mask & (j[None, :] < nb_t[:, None] * compress_ratio)) | tail
-
-        logits = jnp.einsum("tkgd,lkd->tkgl",
-                            qg,
-                            k_r,
-                            preferred_element_type=jnp.float32) * scale
-        logits = jnp.where(mask[:, None, None, :], logits, -jnp.inf)
-        logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-        probs = jnp.exp(logits)
-        probs = probs / jnp.sum(probs, axis=-1, keepdims=True)
-        o_r = jnp.einsum("tkgl,lkd->tkgd",
-                         probs.astype(dtype),
-                         v_r,
-                         preferred_element_type=jnp.float32)
+        mask = (mask & (j[None, :] < nb_t[:, None] * R)) | tail
+        o_r = _masked_softmax_attend(qg, k_r[None], v_r[None], mask, scale,
+                                     dtype)
         o_r = o_r.reshape(T, Hq, D).astype(q.dtype)
         in_r = valid & (req == r)
         out = jnp.where(in_r[:, None, None], o_r, out)
-
     return out, kv_cache
 
 
