@@ -75,11 +75,10 @@ from tpu_inference.models.vllm.vllm_model_wrapper_context import \
 # them (same process) to gather embeddings before each step.
 HOST_NGRAM_TABLES: list = []
 
-# Steps with at most this many (padded) tokens use the sparse-gather QSA path.
-# Off by default: in plain XLA on v6e its per-token gathers are slower than
-# the dense masked path at 8K context (needs a Pallas DMA kernel).
+# Steps with at most this many (padded) tokens use the sparse-gather QSA path
+# (default: all steps); larger steps use the dense masked reference path.
 _QSA_SPARSE_MAX_TOKENS = int(os.environ.get("QWEN4EXP_QSA_SPARSE_MAX_TOKENS",
-                                            "0"))
+                                            str(1 << 30)))
 
 # HF configs name QSA layers "full_attention" (raw) or "indexed_attention".
 _QSA_LAYER_TYPES = ("full_attention", "indexed_attention",

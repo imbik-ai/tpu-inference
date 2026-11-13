@@ -107,30 +107,50 @@ def _qsa_write_and_compress(q, k, v, idx_q, idx_k, kv_cache, positions, bt,
     page = bt[req, jnp.clip(positions // bs, 0, pages_per_req - 1)]
     page = jnp.where(valid, page, N)  # out of range -> dropped
     off = positions % bs
+    # Writes move whole token rows (every head): the cache is sharded over
+    # the head axis under TP, and indexing one head makes the partitioner
+    # gather the whole cache. Reads use dynamic_slice in a fori_loop: an XLA
+    # gather from this layout first copies the whole cache on TPU.
     kv = pad_d(jnp.stack([k, v], axis=2)).astype(dtype)  # (T, Hkv, 2, Dc)
-    kv_cache = kv_cache.at[page, off, :Hkv].set(kv, mode="drop")
-    kv_cache = kv_cache.at[page, off, Hkv, 0].set(pad_d(idx_k).astype(dtype),
-                                                  mode="drop")
+    page_c = jnp.minimum(page, N - 1)
+    # A token's slot is always written before the compressed key stored in
+    # the same slot (see below), so token rows can zero that row.
+    row = jnp.zeros((T, A, P, Dc), dtype).at[:, :Hkv].set(kv)
+    row = row.at[:, Hkv, 0].set(pad_d(idx_k).astype(dtype))
+    kv_cache = kv_cache.at[page, off].set(row, mode="drop")
 
     # Compressed keys: mean of the group's raw keys, k-norm, RoPE at the
     # group's first position. Group g of a page is stored compactly in row
     # (Hkv, 1) of the page's slot g % (bs // R), so a request's compressed
-    # keys are the first bs // R slots of each of its pages. That slot's own
-    # token is always written before the group completes, and token writes
-    # never touch row (Hkv, 1).
+    # keys are the first bs // R slots of each of its pages. That slot's
+    # token (g % (bs // R) <= R * g + R - 1 within the page) is written
+    # first, in an earlier step or earlier in this one.
     assert bs % R == 0
     done = valid & ((positions + 1) % R == 0)
-    gpos = positions[:, None] - (R - 1) + jnp.arange(R, dtype=jnp.int32)
-    gpos = jnp.maximum(gpos, 0)
-    raw = kv_cache[jnp.minimum(page, N - 1)[:, None], gpos % bs, Hkv, 0,
-                   :Di]  # (T, R, Di)
+    slot = (positions // R) % (bs // R)
+    g0 = jnp.maximum(off - (R - 1), 0)
+
+    def read(i, carry):
+        raws, crows = carry
+        raws = raws.at[i].set(
+            jax.lax.dynamic_slice(kv_cache, (page_c[i], g0[i], 0, 0, 0),
+                                  (1, R, A, P, Dc))[0])
+        crows = crows.at[i].set(
+            jax.lax.dynamic_slice(kv_cache, (page_c[i], slot[i], 0, 0, 0),
+                                  (1, 1, A, P, Dc))[0, 0])
+        return raws, crows
+
+    raws, crow = jax.lax.fori_loop(
+        0, T, read, (jnp.zeros((T, R, A, P, Dc), dtype),
+                     jnp.zeros((T, A, P, Dc), dtype)))
+    raw = raws[:, :, Hkv, 0, :Di]  # (T, R, Di)
     pooled = raw.astype(jnp.float32).mean(axis=1).astype(dtype)
     pooled = gemma_rms_norm(pooled, idx_k_norm_weight, eps)
-    ck = rope_neox(pooled[:, None, :], gpos[:, 0], inv_freq)[:, 0, :]
+    ck = rope_neox(pooled[:, None, :], positions - (R - 1), inv_freq)[:, 0, :]
     a_c, p_c = Hkv, 1
-    slot = (positions // R) % (bs // R)
-    kv_cache = kv_cache.at[jnp.where(done, page, N), slot, a_c,
-                           p_c].set(pad_d(ck).astype(dtype), mode="drop")
+    crow = crow.at[:, a_c, p_c].set(pad_d(ck).astype(dtype))
+    kv_cache = kv_cache.at[jnp.where(done, page, N), slot].set(crow,
+                                                               mode="drop")
     return q, idx_q, kv_cache, (a_c, p_c)
 
 
@@ -170,12 +190,12 @@ def qsa_attention(
     compress_ratio: int,
     budget: int,
     scale: float,
-    sparse_max_tokens: int = 64,
+    sparse_max_tokens: int = 1 << 30,
 ):
-    """Steps with at most `sparse_max_tokens` (padded) tokens, i.e. decode,
-    gather only each query's selected keys; larger (prefill) steps run a
+    """Steps with at most `sparse_max_tokens` (padded) tokens gather only
+    each query's selected keys (in chunks of 64 queries); larger steps run a
     dense masked attention per request. Both read the cached compressed
-    keys and give the same result."""
+    keys and give the same result; the sparse path is the default."""
     T, Hq, D = q.shape
     Hkv = k.shape[1]
     Di = idx_k.shape[-1]
@@ -200,42 +220,72 @@ def qsa_attention(
     nb_t = (positions + 1) // R  # complete visible groups
     bvalid = jnp.arange(NB, dtype=jnp.int32)[None, :] < nb_t[:, None]
 
-    def select(ckeys):  # ckeys (T or 1, NB, Di) -> (T, block_topk) group ids
+    def select(iq, ckeys, bv):
+        """iq (t,Hi,Di), ckeys (t or 1, NB, Di), bv (t, NB) -> top groups."""
         scores = jnp.einsum("thd,tbd->thb",
-                            idx_q.astype(jnp.float32),
+                            iq.astype(jnp.float32),
                             ckeys.astype(jnp.float32),
                             preferred_element_type=jnp.float32)
         scores = jnp.maximum(scores, 0.0).sum(axis=1) / math.sqrt(Di)
-        scores = jnp.where(bvalid, scores, -jnp.inf)
+        scores = jnp.where(bv, scores, -jnp.inf)
         vals, top_idx = jax.lax.top_k(scores, block_topk)
         return top_idx, vals > -jnp.inf
 
-    # Compressed keys of the first padded_num_reqs requests: (R_pad, NB, Di).
+    # The pages of the first padded_num_reqs requests, read once with
+    # dynamic slices (no whole-cache copy): (R_pad * MP, bs, A, P, Dc).
     r_pad = padded_num_reqs
-    ck_all = kv_cache[bt[:r_pad], :bs // R, a_c, p_c, :Di].reshape(
-        r_pad, NB, Di)
+    page_ids = bt[:r_pad].reshape(-1)
+
+    def read_page(i, buf):
+        return jax.lax.dynamic_update_slice_in_dim(
+            buf, jax.lax.dynamic_slice_in_dim(kv_cache, page_ids[i], 1, 0), i,
+            0)
+
+    pages_buf = jax.lax.fori_loop(
+        0, page_ids.shape[0], read_page,
+        jnp.zeros((page_ids.shape[0], bs, A, P, Dc), dtype))
+    pages_buf = pages_buf.reshape(r_pad, pages_per_req, bs, A, P, Dc)
+    ck_all = pages_buf[:, :, :bs // R, a_c, p_c, :Di].reshape(r_pad, NB, Di)
 
     if T <= sparse_max_tokens:
         # Sparse: per query, score its request's compressed keys, then gather
         # K/V of the selected groups plus the tail group only, a group (R
-        # contiguous tokens, never across pages) at a time.
-        ckeys = ck_all[jnp.minimum(req, r_pad - 1)]  # (T, NB, Di)
-        top_idx, top_ok = select(ckeys)
-        groups = jnp.concatenate([top_idx, nb_t[:, None]], axis=1)  # (T, S)
-        counts = jnp.concatenate(
-            [jnp.where(top_ok, R, 0), (positions + 1 - nb_t * R)[:, None]],
-            axis=1)
-        gtok = groups * R
-        gpage = bt[req[:, None], jnp.clip(gtok // bs, 0, pages_per_req - 1)]
-        kv6 = kv_cache.reshape(N, bs // R, R, A, P, Dc)
-        kv = kv6[gpage, (gtok % bs) // R, :, :Hkv]  # (T, S, R, Hkv, P, Dc)
-        S = groups.shape[1]
-        keys = kv[..., 0, :D].reshape(T, S * R, Hkv, D)
-        vals = kv[..., 1, :D].reshape(T, S * R, Hkv, D)
-        ok = (jnp.arange(R, dtype=jnp.int32)[None, None, :] <
-              counts[:, :, None]).reshape(T, S * R)
-        out = _masked_softmax_attend(qg, keys, vals, ok, scale, dtype)
-        out = out.reshape(T, Hq, D).astype(q.dtype)
+        # contiguous tokens, never across pages) at a time. Queries run in
+        # chunks of `chunk` to bound the gathered K/V.
+        hist6 = pages_buf.reshape(r_pad, pages_per_req, bs // R, R, A, P, Dc)
+        chunk = min(T, 64)
+        pad = (-T) % chunk
+
+        def run_chunk(args):
+            qg_c, iq_c, req_c, pos_c = args
+            req_c = jnp.minimum(req_c, r_pad - 1)
+            nb_c = (pos_c + 1) // R
+            bv = jnp.arange(NB, dtype=jnp.int32)[None, :] < nb_c[:, None]
+            top_idx, top_ok = select(iq_c, ck_all[req_c], bv)
+            groups = jnp.concatenate([top_idx, nb_c[:, None]], axis=1)
+            counts = jnp.concatenate(
+                [jnp.where(top_ok, R, 0), (pos_c + 1 - nb_c * R)[:, None]],
+                axis=1)
+            gtok = groups * R
+            kv = hist6[req_c[:, None],
+                       jnp.clip(gtok // bs, 0, pages_per_req - 1),
+                       (gtok % bs) // R][:, :, :, :Hkv]  # (c, S, R, Hkv, P, Dc)
+            c, S = groups.shape
+            keys = kv[..., 0, :D].reshape(c, S * R, Hkv, D)
+            vals = kv[..., 1, :D].reshape(c, S * R, Hkv, D)
+            ok = (jnp.arange(R, dtype=jnp.int32)[None, None, :] <
+                  counts[:, :, None]).reshape(c, S * R)
+            return _masked_softmax_attend(qg_c, keys, vals, ok, scale,
+                                          dtype).astype(q.dtype)
+
+        def chunks(x):
+            x = jnp.pad(x, [(0, pad)] + [(0, 0)] * (x.ndim - 1))
+            return x.reshape(-1, chunk, *x.shape[1:])
+
+        out = jax.lax.map(
+            run_chunk, (chunks(qg), chunks(idx_q), chunks(req),
+                        chunks(positions)))
+        out = out.reshape(-1, Hq, D)[:T]
         return jnp.where(valid[:, None, None], out, 0), kv_cache
 
     j = jnp.arange(L, dtype=jnp.int32)
@@ -243,10 +293,10 @@ def qsa_attention(
     tail = (j[None, :] >= nb_t[:, None] * R) & (j[None, :] <= positions[:, None])
     out = jnp.zeros((T, Hq, D), dtype=q.dtype)
     for r in range(padded_num_reqs):
-        hist = kv_cache[bt[r]].reshape(L, C, Dc)  # (L, C, Dc)
+        hist = pages_buf[r].reshape(L, C, Dc)  # (L, C, Dc)
         k_r = hist[:, 0:2 * Hkv:2, :D]  # (L, Hkv, D)
         v_r = hist[:, 1:2 * Hkv:2, :D]
-        top_idx, top_ok = select(ck_all[r][None])
+        top_idx, top_ok = select(idx_q, ck_all[r][None], bvalid)
         sel = jnp.zeros((T, NB), dtype=bool).at[jnp.arange(T)[:, None],
                                                 top_idx].set(top_ok)
         sel = sel & bvalid
