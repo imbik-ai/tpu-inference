@@ -234,17 +234,21 @@ def qsa_attention(
     # The pages of the first padded_num_reqs requests, read once with
     # dynamic slices (no whole-cache copy): (R_pad * MP, bs, A, P, Dc).
     r_pad = padded_num_reqs
-    page_ids = bt[:r_pad].reshape(-1)
+    # Only the pages that hold this step's visible tokens are read (a
+    # dynamic loop bound per request); the rest of the buffer stays zero and
+    # is masked out.
+    last_pos = jnp.full((r_pad, ), -1, jnp.int32).at[jnp.where(
+        valid, req, r_pad)].max(positions, mode="drop")
+    n_pages = (last_pos + bs) // bs  # ceil((last_pos + 1) / bs)
+    pages_buf = jnp.zeros((r_pad, pages_per_req, bs, A, P, Dc), dtype)
+    for r in range(r_pad):
 
-    def read_page(i, buf):
-        return jax.lax.dynamic_update_slice_in_dim(
-            buf, jax.lax.dynamic_slice_in_dim(kv_cache, page_ids[i], 1, 0), i,
-            0)
+        def read_page(i, buf, r=r):
+            page = jax.lax.dynamic_slice_in_dim(kv_cache, bt[r, i], 1, 0)
+            return jax.lax.dynamic_update_slice(buf, page[None],
+                                                (r, i, 0, 0, 0, 0))
 
-    pages_buf = jax.lax.fori_loop(
-        0, page_ids.shape[0], read_page,
-        jnp.zeros((page_ids.shape[0], bs, A, P, Dc), dtype))
-    pages_buf = pages_buf.reshape(r_pad, pages_per_req, bs, A, P, Dc)
+        pages_buf = jax.lax.fori_loop(0, n_pages[r], read_page, pages_buf)
     ck_all = pages_buf[:, :, :bs // R, a_c, p_c, :Di].reshape(r_pad, NB, Di)
 
     if T <= sparse_max_tokens:
