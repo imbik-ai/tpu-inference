@@ -66,6 +66,8 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
                                               make_layers, maybe_prefix)
 from vllm.sequence import IntermediateTensors
 
+from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.hc import (
+    hc_combine, hc_mix)
 from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.qsa import (
     ple_short_conv, qsa_attention)
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
@@ -86,9 +88,16 @@ _DUMP_DIR = os.environ.get("QWEN4EXP_DUMP_DIR")
 _DUMP_CALLS: dict = {}
 
 
+_DUMP_FILTER = os.environ.get("QWEN4EXP_DUMP_FILTER")
+
+
 def _dump(name: str, t: torch.Tensor) -> None:
     if not _DUMP_DIR:
         return
+    if _DUMP_FILTER:
+        import re
+        if not re.fullmatch(_DUMP_FILTER, name):
+            return
     import jax
 
     def save(x, name=name):
@@ -168,22 +177,25 @@ class Qwen4ExpGatedResidual(nn.Module):
             hc_hidden, self.hc_count, bias=False) if use_combine else None)
 
     def mix(self, x: torch.Tensor):
-        xn = self.hc_norm(x)
-        w = F.silu(self.input_mix_weight_down(xn) / self.hc_count)
-        w = torch.sigmoid(self.input_mix_weight_up(w))
-        w = w.unflatten(-1, (self.hc_count, self.hidden_size))
-        mixed = (w * xn.unflatten(-1, (self.hc_count, self.hidden_size))).mean(
-            dim=-2)
-        if self.block_inject_weight is None:
-            return mixed, None
-        inject = 2 * torch.sigmoid(
-            self.block_inject_weight(xn) / self.hc_count)
-        return mixed, inject
+        """Returns (block input (T, H), inject weights (T, C) fp32)."""
+        mixed, inject = hc_mix(
+            jax_view(x),
+            jax_view(self.hc_norm.weight),
+            jax_view(self.input_mix_weight_down.weight),
+            jax_view(self.input_mix_weight_up.weight),
+            None if self.block_inject_weight is None else jax_view(
+                self.block_inject_weight.weight),
+            hc_count=self.hc_count,
+            hidden=self.hidden_size,
+            eps=self.hc_norm.eps)
+        return torch_view(mixed), (None
+                                   if inject is None else torch_view(inject))
 
     @staticmethod
     def combine(x: torch.Tensor, block_out: torch.Tensor,
                 inject: torch.Tensor) -> torch.Tensor:
-        return x + (block_out.unsqueeze(-2) * inject.unsqueeze(-1)).flatten(-2)
+        return torch_view(
+            hc_combine(jax_view(x), jax_view(block_out), jax_view(inject)))
 
 
 class Qwen4ExpNGramTable(nn.Module):
