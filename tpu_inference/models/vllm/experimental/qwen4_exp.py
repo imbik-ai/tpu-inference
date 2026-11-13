@@ -171,19 +171,38 @@ class Qwen4ExpNGramTable(nn.Module):
 
     def __init__(self, layout, dim: int, split_parts: int):
         super().__init__()
-        import ml_dtypes
         self.layout = layout
         self.split_parts = split_parts
         self.dim = dim
-        self.host_table = np.zeros((layout.padded_vocab_size, dim),
-                                   dtype=ml_dtypes.bfloat16)
-        HOST_NGRAM_TABLES.append(self.host_table)
+        # Allocated on the first loaded shard, in the checkpoint's dtype
+        # (bf16, or fp8 e4m3 with a per-tensor scale for ModelOpt FP8).
+        self.host_table: np.ndarray | None = None
+        self.scale = 1.0
+        HOST_NGRAM_TABLES.append(self)
 
     @staticmethod
     def _to_host(w: torch.Tensor) -> np.ndarray:
         import ml_dtypes
-        w = w.detach().to("cpu", torch.bfloat16).contiguous()
+        w = w.detach().to("cpu").contiguous()
+        if w.dtype == torch.float8_e4m3fn:
+            return w.view(torch.uint8).numpy().view(ml_dtypes.float8_e4m3fn)
+        w = w.to(torch.bfloat16)
         return w.view(torch.int16).numpy().view(ml_dtypes.bfloat16)
+
+    def _table_for(self, w: np.ndarray) -> np.ndarray:
+        if self.host_table is None:
+            self.host_table = np.empty(
+                (self.layout.padded_vocab_size, self.dim), dtype=w.dtype)
+        return self.host_table
+
+    def gather(self, ids: np.ndarray) -> np.ndarray:
+        """(n, heads) int32 rows -> (n, heads * dim) bf16 embeddings."""
+        import ml_dtypes
+        rows = self.host_table[ids].reshape(ids.shape[0], -1)
+        if rows.dtype != ml_dtypes.bfloat16 or self.scale != 1.0:
+            rows = (rows.astype(np.float32) * self.scale).astype(
+                ml_dtypes.bfloat16)
+        return rows
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
@@ -192,9 +211,8 @@ class Qwen4ExpNGramTable(nn.Module):
             "ngram_heads_offsets": self.layout.head_offsets,
             "ngram_heads_vocab_sizes": self.layout.head_vocab_sizes,
         }
-        rows = self.host_table.shape[0]
+        rows = self.layout.padded_vocab_size
         shard_rows = -(-rows // self.split_parts)
-        loaded = set()
         for name, w in weights:
             if name in expected:
                 if not np.array_equal(w.cpu().numpy().astype(np.int64),
@@ -202,17 +220,25 @@ class Qwen4ExpNGramTable(nn.Module):
                     raise ValueError(
                         f"PLE hash buffer {name} differs from the host layout")
                 continue
+            if name == "ngram_embedding.weight_scale":
+                if w.numel() != 1:
+                    raise NotImplementedError(
+                        "PLE table scale must be per-tensor")
+                self.scale = float(w.float().item())
+                continue
             prefix = "ngram_embedding.shard_"
             if name.startswith(prefix) and name.endswith(".weight"):
                 start = int(name[len(prefix):-len(".weight")]) * shard_rows
-                self.host_table[start:start + w.shape[0]] = self._to_host(w)
+                h = self._to_host(w)
+                self._table_for(h)[start:start + h.shape[0]] = h
             elif name == "ngram_embedding.weight":
-                self.host_table[:] = self._to_host(w)
+                h = self._to_host(w)
+                self._table_for(h)[:] = h
             else:
                 raise ValueError(f"unexpected PLE table weight {name}")
         # Nothing is registered as a torch parameter; report nothing loaded so
         # the loader does not look for one.
-        return loaded
+        return set()
 
 
 class Qwen4ExpPLE(nn.Module):
