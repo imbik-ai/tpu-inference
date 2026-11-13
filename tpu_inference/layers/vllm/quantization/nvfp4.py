@@ -27,6 +27,7 @@ Important notes:
      on-the-fly.
 """
 
+import re
 from typing import Optional, Sequence, Union
 
 import jax
@@ -296,6 +297,52 @@ class VllmNvfp4LinearMethod(VllmUnquantizedLinearMethod):
         return jnp.concatenate(outs, axis=-1)
 
 
+def nvfp4_moe_keeps_checkpoint_blocks() -> bool:
+    """NVFP4 MoE keeps the checkpoint's e2m1 values and per-16 scales unless
+    a requantization is asked for explicitly. The generic default
+    re-quantizes to e2m1 with one scale per row, which moved expert outputs
+    by about 15% (Qwen3.8 Flash-Next)."""
+    return (envs.DISABLE_WEIGHT_REQUANTIZATION
+            or not (envs.MOE_REQUANTIZE_WEIGHT_DTYPE
+                    or envs.MOE_REQUANTIZE_BLOCK_SIZE))
+
+
+def _maybe_store_e2m1_as_int4(weights: FusedMoEWeights) -> FusedMoEWeights:
+    """TPUs before v7 have no fp4 vectors. With a gmm_v2 that decodes int4
+    bits as e2m1 (INT4_RHS_IS_E2M1), store the weights as int4 bits once
+    here; a per-call bitcast relayouts every expert weight on each step."""
+    if weights.w13_weight.dtype != jnp.float4_e2m1fn:
+        return weights
+    try:
+        kind = jax.devices("tpu")[0].device_kind
+    except RuntimeError:
+        return weights
+    m = re.match(r"TPU( v)?(\d+)", kind)
+    if not (m and int(m[2]) < 7):
+        return weights
+    try:
+        import tokamax._src.ops.gmm_v2.gmm_v2 as tk_gmm_v2
+    except ImportError:
+        return weights
+    if not hasattr(tk_gmm_v2, "INT4_RHS_IS_E2M1"):
+        return weights
+    tk_gmm_v2.INT4_RHS_IS_E2M1 = True
+    to_int4 = jax.jit(lambda w: jax.lax.bitcast_convert_type(w, jnp.int4))
+    # The kernel applies the scale in bf16; storing it in bf16 halves the
+    # scale memory (per-16 blocks: 0.125 instead of 0.25 bytes per weight),
+    # which is what lets the 48-layer NVFP4 model fit a v6e-4. gmm_v2 upcasts
+    # one layer's scales to fp32 per call (its block loads need 32-bit).
+    to_bf16 = jax.jit(lambda s: s.astype(jnp.bfloat16))
+    return FusedMoEWeights(
+        w13_weight=to_int4(weights.w13_weight),
+        w13_weight_scale=to_bf16(weights.w13_weight_scale),
+        w13_bias=weights.w13_bias,
+        w2_weight=to_int4(weights.w2_weight),
+        w2_weight_scale=to_bf16(weights.w2_weight_scale),
+        w2_bias=weights.w2_bias,
+    )
+
+
 class VllmNvfp4MoEMethod(FusedMoEMethodBase):
     """NVFP4 MoE for TPU.
 
@@ -447,6 +494,8 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 weight_block_size=(1, 16),  # NVFP4 block size is 16
                 desired_quant_dtype=desired_quant_dtype,
                 requant_block_size=requant_block_size,
+                disable_weight_requantization=(
+                    nvfp4_moe_keeps_checkpoint_blocks()),
             )
 
         weights = unpack_and_process(
@@ -457,6 +506,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             requant_block_size,
         )
 
+        weights = _maybe_store_e2m1_as_int4(weights)
         weights = torch_view(weights)
 
         layer.w13_weight = Parameter(weights.w13_weight, requires_grad=False)

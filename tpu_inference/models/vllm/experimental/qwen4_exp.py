@@ -80,6 +80,28 @@ HOST_NGRAM_TABLES: list = []
 _QSA_SPARSE_MAX_TOKENS = int(os.environ.get("QWEN4EXP_QSA_SPARSE_MAX_TOKENS",
                                             str(1 << 30)))
 
+# Debug: with QWEN4EXP_DUMP_DIR set, every forward writes the inputs and
+# outputs of each block (host callback) as <dir>/<name>.<call>.npy.
+_DUMP_DIR = os.environ.get("QWEN4EXP_DUMP_DIR")
+_DUMP_CALLS: dict = {}
+
+
+def _dump(name: str, t: torch.Tensor) -> None:
+    if not _DUMP_DIR:
+        return
+    import jax
+
+    def save(x, name=name):
+        k = _DUMP_CALLS.get(name, 0)
+        _DUMP_CALLS[name] = k + 1
+        x = np.asarray(x)
+        if x.dtype.kind == "V" or "bfloat16" in str(x.dtype):
+            x = x.astype(np.float32)
+        np.save(os.path.join(_DUMP_DIR, f"{name}.{k}.npy"), x)
+
+    jax.debug.callback(save, jax_view(t))
+
+
 # HF configs name QSA layers "full_attention" (raw) or "indexed_attention".
 _QSA_LAYER_TYPES = ("full_attention", "indexed_attention",
                     "qwen_sparse_attention")
@@ -499,17 +521,26 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
+        tag = f"L{self.layer_idx}"
+        _dump(tag + ".in", hidden_states)
         if self.ple is not None:
             hidden_states = self.ple(hidden_states)
+            _dump(tag + ".ple_out", hidden_states)
         block_in, inject = self.attn_hyper_connection.mix(hidden_states)
+        _dump(tag + ".attn_in", block_in)
+        _dump(tag + ".attn_inj", inject)
         if self.layer_type == "linear_attention":
             block_out = self.linear_attn(hidden_states=block_in)
         else:
             block_out = self.self_attn(block_in, positions)
+        _dump(tag + ".attn_out", block_out)
         hidden_states = Qwen4ExpGatedResidual.combine(hidden_states,
                                                       block_out, inject)
         block_in, inject = self.mlp_hyper_connection.mix(hidden_states)
+        _dump(tag + ".mlp_in", block_in)
+        _dump(tag + ".mlp_inj", inject)
         block_out = self.mlp(block_in)
+        _dump(tag + ".mlp_out", block_out)
         return Qwen4ExpGatedResidual.combine(hidden_states, block_out, inject)
 
 
@@ -545,9 +576,12 @@ class Qwen4ExpModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         hidden_states = inputs_embeds.repeat(1, self.config.hc_count)
+        _dump("ids", input_ids)
         for layer in self.layers[self.start_layer:self.end_layer]:
             hidden_states = layer(hidden_states, positions)
+        _dump("final_in", hidden_states)
         mixed, _ = self.hyper_connection_mixer.mix(hidden_states)
+        _dump("final_out", mixed)
         return mixed
 
     def load_weights(self, weights: Iterable[tuple[str,
