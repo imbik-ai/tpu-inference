@@ -1085,6 +1085,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.is_multimodal_model = None
         self.uses_mrope = self.model_config.uses_mrope
         self.supports_mm_inputs = True
+        self._init_ple_ngram()
+
+    def _init_ple_ngram(self) -> None:
+        """Qwen4Exp PLE: n-gram ids are hashed on the host every step."""
+        self.ple_ngram_layout = None
+        text_config = getattr(self.model_config, "hf_text_config", None)
+        ple_layer_ids = getattr(text_config, "ple_layer_ids", None)
+        if not ple_layer_ids:
+            return
+        if len(set(ple_layer_ids)) != 1:
+            raise NotImplementedError(
+                "Qwen4Exp TPU supports exactly one PLE layer")
+        from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.ngram import \
+            build_ngram_layout
+        self.ple_ngram_layout = build_ngram_layout(text_config, 0)
 
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
@@ -3054,6 +3069,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                                           key="logits_indices")
 
         # Populates input_ids and positions
+        ple_ngram_ids_cpu = None
         for dp_rank in range(dp_size):
             if num_req_per_dp_rank[dp_rank] == 0:
                 continue
@@ -3099,6 +3115,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             )
 
             input_ids_cpu[total_num_scheduled_tokens:] = 0
+
+            if self.ple_ngram_layout is not None:
+                from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.ngram import \
+                    batch_ngram_ids
+                if ple_ngram_ids_cpu is None:
+                    ple_ngram_ids_cpu = np.zeros(
+                        (padded_total_num_scheduled_tokens,
+                         self.ple_ngram_layout.num_heads),
+                        dtype=np.int32)
+                ple_ngram_ids_cpu[token_offset:token_offset +
+                                  total_num_scheduled_tokens] = (
+                                      batch_ngram_ids(
+                                          self.input_batch.token_ids_cpu,
+                                          req_indices, positions_np,
+                                          self.ple_ngram_layout))
 
         # Prepare the attention metadata (query_start_loc_cpu, seq_lens_cpu)
         for dp_rank in range(dp_size):
@@ -3392,6 +3423,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             and self.input_batch.request_distribution[0]
             == self.input_batch.num_reqs)
 
+        ple_embeddings = None
+        if ple_ngram_ids_cpu is not None:
+            if self.scheduler_config.async_scheduling:
+                raise NotImplementedError(
+                    "Qwen4Exp PLE hashes token history on the host; "
+                    "async scheduling is not supported yet")
+            from tpu_inference.models.vllm.experimental.qwen4_exp import \
+                HOST_NGRAM_TABLES
+            table = HOST_NGRAM_TABLES[0]
+            emb = table[ple_ngram_ids_cpu].reshape(
+                ple_ngram_ids_cpu.shape[0], -1)
+            ple_embeddings = device_array(self.mesh,
+                                          emb,
+                                          sharding=data_parallel_attn_sharding)
+
         def build_attn(block_tables: jax.Array | None,
                        gid: int) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
@@ -3408,6 +3454,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 is_decode=is_decode_only,
                 gdn_read_offsets=gdn_read_offsets,
                 num_spec_tokens=num_spec_tokens,
+                ple_embeddings=ple_embeddings,
             )
 
             return attention_metadata_gid
@@ -3423,6 +3470,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 is_decode=is_decode_only,
                 gdn_read_offsets=gdn_read_offsets,
                 num_spec_tokens=num_spec_tokens,
+                ple_embeddings=ple_embeddings,
             )
 
         attention_metadata: AttentionMetadata | dict[str, AttentionMetadata]

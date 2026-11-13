@@ -70,6 +70,7 @@ class PCPMetadata:
         "pcp",
         "backend_metadata",
         "gdn_read_offsets",
+        "ple_embeddings",
     ],
     meta_fields=[
         "padded_num_reqs",
@@ -134,6 +135,11 @@ class AttentionMetadata(object):
     # STATIC: number of speculative draft tokens (K) per verification step.
     num_spec_tokens: int = 0
 
+    # (padded_total_num_scheduled_tokens, ple_embed_dim) Qwen4Exp PLE n-gram
+    # embeddings per scheduled token, hashed and gathered on the host from
+    # the request's token history. None for models without PLE.
+    ple_embeddings: jax.Array | None = None
+
 
 @functools.partial(
     jax.tree_util.register_dataclass,
@@ -144,6 +150,7 @@ class AttentionMetadata(object):
         "request_distribution",
         "mamba_state_indices",
         "gdn_read_offsets",
+        "ple_embeddings",
     ],
     meta_fields=[
         "padded_num_reqs",
@@ -186,6 +193,11 @@ class SharedAttentionMetadata(object):
 
     # STATIC: number of speculative draft tokens (K) per verification step.
     num_spec_tokens: int = 0
+
+    # (padded_total_num_scheduled_tokens, ple_embed_dim) Qwen4Exp PLE n-gram
+    # embeddings per scheduled token, hashed and gathered on the host from
+    # the request's token history. None for models without PLE.
+    ple_embeddings: jax.Array | None = None
 
 
 class GroupedAttentionMetadata(dict):

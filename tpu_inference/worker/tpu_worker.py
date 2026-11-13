@@ -423,6 +423,12 @@ class TPUWorker(WorkerBase):
         # missing TP-partner ranks. Force a singleton view for this init only.
         saved_dp_size = self.parallel_config.data_parallel_size
         self.parallel_config.data_parallel_size = 1
+        # vLLM sizes an Engram (n-gram embedding, e.g. Qwen4Exp PLE) process
+        # group from tensor_parallel_size; under SPMD the torch-side TP size
+        # is 1, so build the groups without it.
+        saved_engram_config = getattr(self.vllm_config, "engram_config", None)
+        if saved_engram_config is not None:
+            self.vllm_config.engram_config = None
         try:
             with set_current_vllm_config(self.vllm_config):
                 # Close the file descriptor returned by mkstemp to prevent a resource leak.
@@ -444,6 +450,8 @@ class TPUWorker(WorkerBase):
                 )
         finally:
             self.parallel_config.data_parallel_size = saved_dp_size
+            if saved_engram_config is not None:
+                self.vllm_config.engram_config = saved_engram_config
 
         pp_rank = 0 if self.parallel_config.pipeline_parallel_size == 1 else self.rank
         jax_parallel_state.init_pp_distributed_environment(
