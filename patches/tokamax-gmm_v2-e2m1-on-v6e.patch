@@ -3,7 +3,7 @@
 # v6e has no fp4 vectors. The patch carries fp4 (e2m1) expert weights as int4 bits and decodes them
 # to bf16 in VMEM. The NVFP4 MoE path for qwen4_exp needs it. Apply: patch <installed gmm_v2.py> < this file
 --- gmm_v2.orig.py	2026-11-13 13:07:29
-+++ gmm_v2.py	2026-11-14 03:55:18
++++ gmm_v2.py	2026-11-14 04:28:22
 @@ -185,6 +185,14 @@
    def get_scale(self, replicate_size: int | None = None) -> jax.Array:
      assert self.scale is not None
@@ -43,10 +43,12 @@
      assert self.quant_block_size is not None
      mxu_size = pltpu.get_tpu_info().mxu_column_size
      return self.quant_block_size < mxu_size
-@@ -321,6 +339,30 @@
+@@ -319,6 +337,33 @@
+     if self.quant_dtype is None:
+       return False
      return self.quant_dtype != self.dtype
- 
- 
++
++
 +def _decode_e2m1_bits(x_int4: jax.Array, dtype) -> jax.Array:
 +  """e2m1 values from their bits held in an int4 vector (sign = bit 3)."""
 +  x = x_int4.astype(jnp.float32)  # two's complement: -8..7
@@ -62,6 +64,9 @@
 +INT4_RHS_IS_E2M1 = False
 +# rhs_scale may be [group, num_blocks, n] (compact) with e2m1 weights.
 +SCALE_COMPACT_OK = True
++# Compact ([group, rows, n]) scales are NVFP4 per-16 block scales; rows may be
++# padded past size_k // 16.
++E2M1_SCALE_BLOCK = 16
 +
 +
 +def _needs_e2m1_emulation(rhs_dtype) -> bool:
@@ -69,12 +74,10 @@
 +    return False
 +  gen = getattr(pltpu.get_tpu_info(), "generation", None)
 +  return type(gen) is int and gen < 7
-+
-+
+ 
+ 
  @dataclasses.dataclass(frozen=True)
- class GmmConfigs:
-   tiles: TileSizes
-@@ -420,6 +462,8 @@
+@@ -420,6 +465,8 @@
      k_row = k_id * self.cfgs.tiles.tile_k
      b_row = k_row // self.cfgs.rhs_cfgs.quant_block_size  # pyrefly: ignore[unsupported-operation]
      b_tile_id = b_row // self.cfgs.num_quant_blocks_per_tile_k
@@ -83,7 +86,7 @@
      return (group_id, b_tile_id, 0, n_id)
  
    def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
-@@ -494,7 +538,9 @@
+@@ -494,7 +541,9 @@
      )
    if cfgs.rhs_cfgs.has_scale:
      rhs_scale_block_spec = pl.BlockSpec(
@@ -94,7 +97,7 @@
          index_map.rhs_scale_index_map,
      )
  
-@@ -601,7 +647,11 @@
+@@ -601,7 +650,11 @@
            cfgs.lhs_cfgs.dtype
        )
        num_blocks = cfgs.num_quant_blocks_per_tile_k
@@ -107,7 +110,7 @@
            num_blocks, rhs_qbs, rhs_tile_n
        )
        tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
-@@ -1433,7 +1483,8 @@
+@@ -1433,10 +1486,14 @@
        )
    if rhs_scale is not None:
      num_quant_blocks = rhs_scale.shape[1]
@@ -117,7 +120,13 @@
          f"rhs_scale shape {rhs_scale.shape}. Expecting ({size_group},"
          f" {num_quant_blocks}, 1, {size_n})"
      )
-@@ -1549,6 +1600,7 @@
++    if rhs_scale.ndim == 3:  # compact: per-16 blocks, rows may be padded
++      num_quant_blocks = size_k // E2M1_SCALE_BLOCK
++      assert rhs_scale.shape[1] >= num_quant_blocks, rhs_scale.shape
+     assert size_k % num_quant_blocks == 0
+ 
+   if lhs_scale is not None:
+@@ -1549,6 +1606,7 @@
      transpose_rhs: bool = False,
      lhs_quant_dtype: jnp.dtype | None = None,
      rhs_quant_dtype: jnp.dtype | None = None,
@@ -125,7 +134,19 @@
  ):
    """Fills the GMM config for the GMM kernel."""
    packing_factor = get_packing_factor(rhs.dtype, rhs_quant_dtype)
-@@ -1586,6 +1638,8 @@
+@@ -1575,6 +1633,11 @@
+     rhs_quant_dtype = rhs_quant_dtype or rhs.dtype
+     num_blocks = rhs_scale.shape[1]
+     block_size = dims.size_k // num_blocks
++    if rhs_scale.ndim == 3:
++      # Compact e2m1 scales: NVFP4 blocks of 16 inputs; the block rows may
++      # be padded to a multiple of 16 (bf16 sublane packing), so the row
++      # count does not give the block size.
++      block_size = E2M1_SCALE_BLOCK
+   else:
+     has_scale = False
+     block_size = dims.size_k
+@@ -1586,6 +1649,8 @@
        has_bias=rhs_bias is not None,
        has_scale=has_scale,
        is_transposed=transpose_rhs,
@@ -134,10 +155,11 @@
    )
  
    lhs_q_dtype = None
-@@ -1785,6 +1839,19 @@
+@@ -1784,7 +1849,20 @@
+ 
    if vmem_limit_bytes is None:
      vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
- 
++
 +  e2m1_emulated = _needs_e2m1_emulation(rhs.dtype)
 +  if e2m1_emulated:
 +    if rhs_scale is None:
@@ -148,13 +170,13 @@
 +  elif (INT4_RHS_IS_E2M1 and jnp.dtype(rhs.dtype) == jnp.dtype(jnp.int4)
 +        and rhs_scale is not None):
 +    e2m1_emulated = True
-+
+ 
 +  if rhs_scale is not None and rhs_scale.ndim == 3 and not e2m1_emulated:
 +    raise NotImplementedError("[group, blocks, n] scales need e2m1 weights")
    cfgs = make_gmm_configs(
        lhs,
        rhs,
-@@ -1804,6 +1871,7 @@
+@@ -1804,6 +1882,7 @@
        transpose_rhs=transpose_rhs,
        lhs_quant_dtype=lhs_quant_dtype,
        rhs_quant_dtype=rhs_quant_dtype,
@@ -162,7 +184,7 @@
    )
    dims = cfgs.dims
    tiles = cfgs.tiles
-@@ -1815,7 +1883,10 @@
+@@ -1815,7 +1894,10 @@
    else:
      lhs_scale = None
  

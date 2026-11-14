@@ -341,15 +341,33 @@ def _maybe_store_e2m1_as_int4(weights: FusedMoEWeights) -> FusedMoEWeights:
         # second-minor dim gets a compact HBM layout that gmm_v2 cannot read,
         # so XLA copied every layer's scales into the kernel's layout on each
         # call (about a quarter of a 53k decode step on v6e-4).
+        # The block rows each device holds are also padded to a multiple of
+        # 16 (bf16 sublane packing): with fewer (w2 under TP: 40 / 4 = 10)
+        # XLA again picks a layout the kernel cannot read.
         spec = getattr(s.sharding, "spec", None)
-        out_sharding = None
+        out_sharding, n_shards = None, 1
         if spec is not None:
             spec = tuple(spec) + (None, ) * (4 - len(spec))
+            mesh = s.sharding.mesh
             out_sharding = jax.sharding.NamedSharding(
-                s.sharding.mesh,
-                jax.sharding.PartitionSpec(spec[0], spec[1], spec[3]))
-        return jax.jit(lambda s: s[:, :, 0, :].astype(jnp.bfloat16),
-                       out_shardings=out_sharding)(s)
+                mesh, jax.sharding.PartitionSpec(spec[0], spec[1], spec[3]))
+            axes = spec[1] if isinstance(spec[1], tuple) else (spec[1], )
+            for a in axes:
+                if a is not None:
+                    n_shards *= mesh.shape[a]
+        E, B, _, N = s.shape
+        rows = B // n_shards
+        pad = -rows % 16
+
+        def drop_unit_dim(s):
+            s = s[:, :, 0, :].astype(jnp.bfloat16)
+            if pad:
+                s = s.reshape(E, n_shards, rows, N)
+                s = jnp.pad(s, ((0, 0), (0, 0), (0, pad), (0, 0)))
+                s = s.reshape(E, n_shards * (rows + pad), N)
+            return s
+
+        return jax.jit(drop_unit_dim, out_shardings=out_sharding)(s)
 
     return FusedMoEWeights(
         w13_weight=to_int4(weights.w13_weight),
