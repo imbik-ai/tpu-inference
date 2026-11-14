@@ -381,8 +381,14 @@ class KVCacheManager:
         def round_down(blocks: int) -> int:
             return (blocks // divisor) * divisor
 
-        # max_num_reqs already includes the DP multiplier
-        max_num_reqs = self.runner.max_num_reqs
+        # Requests that can hold mamba slots at once: the scheduler never
+        # runs more than max_num_seqs per DP rank. The runner's max_num_reqs
+        # is padded up to MIN_NUM_SEQS for its batch shapes, and sizing the
+        # pool from it would reserve state slots no request can use (at
+        # long context those slots cost whole requests' worth of KV).
+        max_num_reqs = min(
+            self.runner.max_num_reqs,
+            self.runner.dp_size * self.runner.scheduler_config.max_num_seqs)
         min_blocks_per_req, mamba_blocks_per_req = mamba_blocks_per_request(
             self.runner.vllm_config, is_align_mode)
         attn_blocks_per_req = max(
