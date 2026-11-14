@@ -1596,6 +1596,29 @@ class TestKVCacheManager:
         assert (
             self.runner.cache_config.num_gpu_blocks_override == expected_attn)
 
+    def test_compact_mamba_override_ignores_padded_request_floor(self):
+        """The runner pads max_num_reqs up to MIN_NUM_SEQS for batch shapes;
+        the mamba pool must follow the scheduler's max_num_seqs instead, or
+        a 1-request long-context server reserves 8 requests' state."""
+        from tpu_inference.runner.kv_cache_manager import KVCacheManager
+        manager = KVCacheManager(self.runner)
+        manager.use_mla = False
+
+        self.runner.cache_config.gpu_memory_utilization = 1.0
+        self.runner.cache_config.num_gpu_blocks_override = None
+        self.runner.model_config.max_model_len = 2048
+        self.runner.scheduler_config = MagicMock(max_num_seqs=1)
+        self.runner.max_num_reqs = 8  # padded floor
+
+        with patch(
+                "tpu_inference.runner.kv_cache_manager.utils.hbm_usage_bytes",
+                return_value=[(0, 304 * (2**30) // 4)] * 4):
+            self._run_compact_mamba_override(manager,
+                                             attn_page=2**20,
+                                             unpadded_mamba=4 * (2**20))
+
+        assert manager._mamba_num_blocks == 1 + 1
+
     def test_compact_mamba_override_skipped_when_hbm_probe_fails(self):
         """`hbm_usage_bytes` raises on CPU-only test machines (no real
         devices to query). Compact-mamba must skip the override silently —
