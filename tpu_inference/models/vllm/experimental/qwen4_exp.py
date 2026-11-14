@@ -99,8 +99,15 @@ _DUMP_CALLS: dict = {}
 _DUMP_FILTER = os.environ.get("QWEN4EXP_DUMP_FILTER")
 
 
+# Dump only calls with at most this many (padded) tokens, e.g. decode and
+# verify steps but not long prefill chunks.
+_DUMP_MAX_T = int(os.environ.get("QWEN4EXP_DUMP_MAX_T", "0"))
+
+
 def _dump(name: str, t: torch.Tensor) -> None:
     if not _DUMP_DIR:
+        return
+    if _DUMP_MAX_T and t.shape[0] > _DUMP_MAX_T:
         return
     if _DUMP_FILTER:
         import re
