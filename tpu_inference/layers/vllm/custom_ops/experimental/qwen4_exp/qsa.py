@@ -184,6 +184,7 @@ def qsa_attention(
     budget: int,
     scale: float,
     sparse_max_tokens: int = 1 << 30,
+    union_cap: int = 2048,
     mesh=None,
     head_axis=None,
     cache_spec=None,
@@ -248,12 +249,8 @@ def qsa_attention(
         chunk = min(T, 64)
         pad = (-T) % chunk
 
-        def run_chunk(args):
-            qg_c, iq_c, req_c, pos_c = args
-            req_c = jnp.minimum(req_c, r_pad - 1)
-            nb_c = (pos_c + 1) // R
-            bv = jnp.arange(NB, dtype=jnp.int32)[None, :] < nb_c[:, None]
-            top_idx, top_ok = select(iq_c, ck_all[req_c], bv)
+        def per_query(qg_c, req_c, pos_c, nb_c, top_idx, top_ok):
+            """Each query gathers its own selected groups (no sharing)."""
             groups = jnp.concatenate([top_idx, nb_c[:, None]], axis=1)
             counts = jnp.concatenate(
                 [jnp.where(top_ok, R, 0), (pos_c + 1 - nb_c * R)[:, None]],
@@ -272,13 +269,67 @@ def qsa_attention(
             return _masked_softmax_attend(qg_c, keys, vals, ok, scale,
                                           dtype).astype(q.dtype)
 
+        n_gid = r_pad * NB  # union ids: request * NB + group
+
+        def shared(qg_c, req_c, pos_c, nb_c, top_idx, top_ok, valid_c):
+            """The chunk's queries share one gather of the union of their
+            groups (selected + tails); each query masks to its own."""
+            c = qg_c.shape[0]
+            sel_gid = jnp.where(top_ok & valid_c[:, None],
+                                req_c[:, None] * NB + top_idx, n_gid)
+            cnt = pos_c + 1 - nb_c * R
+            tail_gid = jnp.where(valid_c & (cnt > 0), req_c * NB + nb_c,
+                                 n_gid)
+            qbits = jnp.zeros((c, n_gid + 1), bool)
+            qbits = qbits.at[jnp.arange(c)[:, None], sel_gid].set(True)
+            ubits = qbits.any(axis=0).at[tail_gid].set(True)[:n_gid]
+            uidx = jnp.nonzero(ubits, size=union_cap, fill_value=0)[0]
+            u_ok = jnp.arange(union_cap) < ubits.sum()
+            u_req, u_grp = uidx // NB, uidx % NB
+            in_sel = qbits[:, uidx] & u_ok[None, :]
+            is_tail = (uidx[None, :] == tail_gid[:, None]) & u_ok[None, :]
+            ok = in_sel[:, :, None] | (is_tail[:, :, None] & (
+                jnp.arange(R, dtype=jnp.int32)[None, None, :] <
+                cnt[:, None, None]))  # (c, U, R)
+            utok = u_grp * R
+            upage = bt[u_req, jnp.clip(utok // bs, 0, pages_per_req - 1)]
+            kv = gather(kv_cache, upage, utok % bs, length=R)
+            kv = kv[:, :, :Hkv]  # (U, R, Hkv, P, Dc)
+            keys = kv[..., 0, :D].reshape(1, union_cap * R, Hkv, D)
+            vals = kv[..., 1, :D].reshape(1, union_cap * R, Hkv, D)
+            return _masked_softmax_attend(qg_c, keys, vals,
+                                          ok.reshape(c, union_cap * R), scale,
+                                          dtype).astype(q.dtype)
+
+        def run_chunk(args):
+            qg_c, iq_c, req_c, pos_c, valid_c = args
+            req_c = jnp.minimum(req_c, r_pad - 1)
+            nb_c = (pos_c + 1) // R
+            bv = jnp.arange(NB, dtype=jnp.int32)[None, :] < nb_c[:, None]
+            top_idx, top_ok = select(iq_c, ck_all[req_c], bv)
+            if union_cap <= 0:
+                return per_query(qg_c, req_c, pos_c, nb_c, top_idx, top_ok)
+            # Union size, computed the same way as in `shared`.
+            sel_gid = jnp.where(top_ok & valid_c[:, None],
+                                req_c[:, None] * NB + top_idx, n_gid)
+            bits = jnp.zeros((n_gid + 1, ), bool).at[sel_gid].set(True)
+            cnt = pos_c + 1 - nb_c * R
+            bits = bits.at[jnp.where(valid_c & (cnt > 0), req_c * NB + nb_c,
+                                     n_gid)].set(True)
+            n_union = bits[:n_gid].sum()
+            return jax.lax.cond(
+                n_union <= union_cap,
+                lambda: shared(qg_c, req_c, pos_c, nb_c, top_idx, top_ok,
+                               valid_c),
+                lambda: per_query(qg_c, req_c, pos_c, nb_c, top_idx, top_ok))
+
         def chunks(x):
             x = jnp.pad(x, [(0, pad)] + [(0, 0)] * (x.ndim - 1))
             return x.reshape(-1, chunk, *x.shape[1:])
 
         out = jax.lax.map(
             run_chunk, (chunks(qg), chunks(idx_q), chunks(req),
-                        chunks(positions)))
+                        chunks(positions), chunks(valid)))
         out = out.reshape(-1, Hq, D)[:T]
         return jnp.where(valid[:, None, None], out, 0), kv_cache
 
