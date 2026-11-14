@@ -1,4 +1,5 @@
 # Patch for tokamax 0.0.18.dev20261107, file gmm_v2.py (the gmm_v2 grouped-matmul kernel).
+# It also applies (line offsets only) to 0.0.18.dev20261029, the version requirements.txt pins.
 # v6e has no fp4 vectors. The patch carries fp4 (e2m1) expert weights as int4 bits and decodes them
 # to bf16 in VMEM. The NVFP4 MoE path for qwen4_exp needs it. Apply: patch <installed gmm_v2.py> < this file
 --- gmm_v2.orig.py	2026-11-13 13:07:29
