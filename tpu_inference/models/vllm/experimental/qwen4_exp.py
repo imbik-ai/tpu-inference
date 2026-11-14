@@ -67,6 +67,7 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
                                               make_layers, maybe_prefix)
 from vllm.sequence import IntermediateTensors
 
+from tpu_inference import envs
 from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.hc import (
     hc_combine, hc_mix)
 from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.qsa import (
@@ -351,6 +352,10 @@ class Qwen4ExpPLE(nn.Module):
         idx = ctx.layer_name_to_kvcache_index[self.gdn_layer_name]
         conv_state, ssm_state = ctx.kv_caches[idx]
         num_reqs = md.request_distribution[2]
+        if md.mamba.read_offsets is not None:
+            _dump("roff", torch_view(md.mamba.read_offsets))
+        _dump("sidx", torch_view(md.mamba.state_indices))
+        _dump("dist", torch_view(md.request_distribution))
         out, new_conv_state = ple_short_conv(
             jax_view(normed),
             jax_view(self.conv1d.weight),
@@ -601,6 +606,14 @@ class Qwen4ExpModel(nn.Module):
         spec = vllm_config.speculative_config
         self.emit_mtp_hidden = (spec is not None
                                 and getattr(spec, "method", None) == "mtp")
+        if spec is not None and not envs.USE_BATCHED_RPA_KERNEL:
+            # Without it the runner treats verify windows as prefill: the
+            # GDN/PLE states keep only the state after the last draft
+            # token, so a rejected draft stays in the recurrent state.
+            raise ValueError(
+                "Qwen4Exp speculative decoding needs USE_BATCHED_RPA_KERNEL=1 "
+                "(verify windows must run as decode windows with per-token "
+                "state checkpoints).")
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -611,6 +624,7 @@ class Qwen4ExpModel(nn.Module):
             inputs_embeds = self.embed_input_ids(input_ids)
         hidden_states = inputs_embeds.repeat(1, self.config.hc_count)
         _dump("ids", input_ids)
+        _dump("pos", positions)
         for layer in self.layers[self.start_layer:self.end_layer]:
             hidden_states = layer(hidden_states, positions)
         _dump("final_in", hidden_states)
