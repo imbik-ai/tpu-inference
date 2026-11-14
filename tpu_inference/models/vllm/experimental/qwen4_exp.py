@@ -70,6 +70,8 @@ from vllm.sequence import IntermediateTensors
 from tpu_inference import envs
 from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.hc import (
     hc_combine, hc_mix)
+from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.nvfp4_quant import \
+    quantize_nvfp4
 from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.qsa import (
     ple_short_conv, qsa_attention)
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -734,6 +736,26 @@ class Qwen4ExpForConditionalGeneration(Qwen4ExpForCausalLM):
     tower weights are skipped."""
 
 
+# MTP experts are FP8 block-scaled in the checkpoint. Storing them as NVFP4
+# (quantized at load, per-16 e4m3 scales) instead of bf16 saves about 3.5 GB
+# of HBM, which a long-context request needs for KV. Only the drafter's
+# proposals change; verification keeps the target's outputs exact.
+_MTP_EXPERTS_NVFP4 = os.environ.get("QWEN4EXP_MTP_EXPERTS",
+                                    "nvfp4") == "nvfp4"
+def _nvfp4_tensors(key: str, ws: list, names=None):
+    """Checkpoint-style NVFP4 tensors for one expert projection (or the
+    gate/up pair under one shared global scale)."""
+    amax = max(float(w.float().abs().max()) for w in ws)
+    g = torch.tensor(max(amax, 1e-12) / (6.0 * 448.0), dtype=torch.float32)
+    for i, w in enumerate(ws):
+        k = key if names is None else f"{key}.{names[i]}"
+        packed, s = quantize_nvfp4(w, g)
+        yield k + ".weight", packed
+        yield k + ".weight_scale", s
+        yield k + ".weight_scale_2", g.clone()
+        yield k + ".input_scale", torch.tensor(1.0, dtype=torch.float32)
+
+
 class Qwen4ExpMTP(nn.Module):
     """Qwen4Exp multi-token-prediction draft model (one QSA + MoE layer).
 
@@ -742,7 +764,8 @@ class Qwen4ExpMTP(nn.Module):
     vLLM's Qwen4ExpMultiTokenPredictor: normed token embedding and normed
     multi stream are projected, the embedding is added to every stream, one
     hyper-connected decoder layer runs, and the final mixer gives the LM-head
-    stream. The FP8 block-scaled MTP experts are dequantized to bf16 at load.
+    stream. The FP8 block-scaled MTP experts are dequantized at load and
+    stored as NVFP4 (or bf16 with QWEN4EXP_MTP_EXPERTS=bf16).
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -761,9 +784,16 @@ class Qwen4ExpMTP(nn.Module):
         self.fc_hidden = nn.Linear(H, H, bias=False)
         self.pre_fc_norm_embedding = Qwen4ExpRMSNorm(H, eps)
         self.pre_fc_norm_hidden = Qwen4ExpRMSNorm(H * C, eps)
+        layer_prefix = f"mtp.layers.{self.mtp_start}"
+        quant_config = vllm_config.quant_config
+        self.experts_nvfp4 = (_MTP_EXPERTS_NVFP4 and quant_config is not None
+                              and quant_config.get_name() == "modelopt_mixed")
+        if self.experts_nvfp4:
+            quant_config.nvfp4_moe_prefixes = (
+                *getattr(quant_config, "nvfp4_moe_prefixes", ()),
+                layer_prefix + ".")
         self.layers = nn.ModuleList([
-            Qwen4ExpDecoderLayer(vllm_config, "full_attention",
-                                 f"mtp.layers.{self.mtp_start}")
+            Qwen4ExpDecoderLayer(vllm_config, "full_attention", layer_prefix)
         ])
         self.hyper_connection_mixer = Qwen4ExpGatedResidual(config,
                                                             use_combine=False)
@@ -835,7 +865,23 @@ class Qwen4ExpMTP(nn.Module):
                             128, 0)[:wf.shape[0]].repeat_interleave(
                                 128, 1)[:, :wf.shape[1]]
                         del pending[key]
-                        yield key + ".weight", (wf * s).to(torch.bfloat16)
+                        w_bf16 = (wf * s).to(torch.bfloat16)
+                        if not self.experts_nvfp4:
+                            yield key + ".weight", w_bf16
+                            continue
+                        # gate/up share one global scale (their outputs are
+                        # fused); quantize once both have arrived.
+                        ekey, proj = key.rsplit(".", 1)
+                        if proj == "down_proj":
+                            yield from _nvfp4_tensors(key, [w_bf16])
+                            continue
+                        grp = pending.setdefault(ekey + ".gate_up", {})
+                        grp[proj] = w_bf16
+                        if len(grp) == 2:
+                            del pending[ekey + ".gate_up"]
+                            yield from _nvfp4_tensors(
+                                ekey, [grp["gate_proj"], grp["up_proj"]],
+                                names=("gate_proj", "up_proj"))
                     continue
                 yield name, w
 

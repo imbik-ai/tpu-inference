@@ -60,6 +60,12 @@ class VllmModelOptMixedConfig(ModelOptMixedPrecisionConfig, VllmQuantConfig):
             return None
         algo = (None if self.is_layer_excluded(prefix) else
                 self._resolve_quant_algo(prefix))
+        # A model may store experts the checkpoint keeps in another format
+        # as NVFP4 (it quantizes them at load), e.g. Qwen4Exp's MTP layer.
+        if algo is None and isinstance(layer, RoutedExperts) and any(
+                prefix.startswith(p)
+                for p in getattr(self, "nvfp4_moe_prefixes", ())):
+            algo = "NVFP4"
         if isinstance(layer, LinearBase):
             if algo is None:
                 return VllmUnquantizedLinearMethod(
