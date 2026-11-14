@@ -38,6 +38,7 @@ import types
 from collections.abc import Iterable
 
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 import numpy as np
 import torch
 import torch.nn as nn
@@ -70,6 +71,7 @@ from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.hc import (
     hc_combine, hc_mix)
 from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.qsa import (
     ple_short_conv, qsa_attention)
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
 
@@ -473,6 +475,10 @@ class Qwen4ExpQSAAttention(nn.Module):
             budget=self.budget,
             scale=self.scaling,
             sparse_max_tokens=_QSA_SPARSE_MAX_TOKENS,
+            mesh=ctx.mesh,
+            head_axis=ShardingAxisName.KV_HEAD,
+            cache_spec=P(ShardingAxisName.BATCH, ShardingAxisName.KV_CONTEXT,
+                         ShardingAxisName.KV_HEAD),
         )
         ctx.kv_caches[cache_idx] = new_cache
         out = torch_view(out).reshape(T, -1) * torch.sigmoid(gate)
