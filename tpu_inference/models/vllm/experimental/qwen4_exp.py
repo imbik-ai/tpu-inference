@@ -26,7 +26,7 @@ First version: correct, not fast. Text only, no MTP.
 * Hyper-connections and the PLE gate are plain torch ops.
 * PLE: the runner hashes n-gram ids from each request's token history and
   gathers the rows from a host copy of the n-gram table before each step
-  (MambaMetadata.ple_embeddings); the table never goes to HBM.
+  (AttentionMetadata.ple_embeddings); the table never goes to HBM.
 
 Math follows transformers' modeling_qwen4_exp.py (Apache 2.0, The Qwen Team
 and The HuggingFace Inc. team).
@@ -68,6 +68,9 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
 from vllm.sequence import IntermediateTensors
 
 from tpu_inference import envs
+from tpu_inference.layers.common.gdn_attention import resolve_gdn_state_slots
+from tpu_inference.layers.common.utils import truncate_sharded_tensor
+from tpu_inference.utils import get_mesh_shape_product
 from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.hc import (
     hc_combine, hc_mix)
 from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.nvfp4_quant import \
@@ -325,16 +328,19 @@ class Qwen4ExpPLE(nn.Module):
         self.num_spec = (spec.num_speculative_tokens
                          if spec is not None else 0)
         self.gdn_conv_rows = config.linear_conv_kernel_dim - 1
+        cache_config = get_current_vllm_config().cache_config
+        self.mamba_block_size = (cache_config.mamba_block_size
+                                 if cache_config.mamba_cache_mode == "align"
+                                 else 0)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         md = _attn_metadata_for(self.gdn_layer_name)
-        if md.mamba is None or getattr(md.mamba, "ple_embeddings",
-                                       None) is None:
+        if getattr(md, "ple_embeddings", None) is None:
             raise RuntimeError(
-                "Qwen4Exp PLE needs MambaMetadata.ple_embeddings from the "
-                "runner")
+                "Qwen4Exp PLE needs AttentionMetadata.ple_embeddings from "
+                "the runner")
         num_tokens = hidden_states.shape[0]
-        emb = torch_view(md.mamba.ple_embeddings[:num_tokens])
+        emb = torch_view(md.ple_embeddings[:num_tokens])
         key = self.norm_key(self.key_proj(emb)).unflatten(
             -1, (self.hc_count, self.hidden_size))
         value = self.value_proj(emb)
@@ -354,25 +360,48 @@ class Qwen4ExpPLE(nn.Module):
         idx = ctx.layer_name_to_kvcache_index[self.gdn_layer_name]
         conv_state, ssm_state = ctx.kv_caches[idx]
         num_reqs = md.request_distribution[2]
-        if md.mamba.read_offsets is not None:
-            _dump("roff", torch_view(md.mamba.read_offsets))
-        _dump("sidx", torch_view(md.mamba.state_indices))
+        max_reqs = md.seq_lens.shape[0]
+        # The same slots the layer's GDN op reads and writes (compact pool,
+        # spec-decode checkpoints, or align-mode prefix-cache blocks); the
+        # GDN op runs after this and copies whole slots (PLE rows included)
+        # at prefix-cache block boundaries.
+        dp_size = get_mesh_shape_product(ctx.mesh, ShardingAxisName.ATTN_DATA)
+        padded_per_dp = md.padded_num_reqs // dp_size
+        slots = resolve_gdn_state_slots(
+            md,
+            seq_lens=truncate_sharded_tensor(md.seq_lens, padded_per_dp,
+                                             dp_size),
+            query_start_loc=truncate_sharded_tensor(md.query_start_loc,
+                                                    padded_per_dp + 1,
+                                                    dp_size),
+            padded_num_reqs_per_dp=padded_per_dp,
+            dp_size=dp_size,
+            num_local_rows=max(conv_state.shape[0] // dp_size, 1),
+            mamba_block_size=self.mamba_block_size,
+        )
+
+        def full(x):  # per-request arrays are padded to max_reqs
+            return jnp.pad(x, (0, max_reqs - x.shape[0]))
+
+        _dump("sidx", torch_view(slots.state_indices))
         _dump("dist", torch_view(md.request_distribution))
         out, new_conv_state = ple_short_conv(
             jax_view(normed),
             jax_view(self.conv1d.weight),
             conv_state,
-            md.mamba.state_indices,
+            full(slots.state_indices),
             md.query_start_loc,
             md.seq_lens,
             num_reqs,
             row_offset=self.gdn_conv_rows,
             dilation=self.dilation,
-            max_reqs=md.seq_lens.shape[0],
+            max_reqs=max_reqs,
             padded_num_reqs=md.padded_num_reqs,
-            read_offsets=md.mamba.read_offsets,
-            num_spec=self.num_spec if md.mamba.read_offsets is not None else 0,
+            read_offsets=(None if slots.read_offsets is None else full(
+                slots.read_offsets)),
+            num_spec=slots.num_spec_tokens,
             num_windowed=md.request_distribution[0],
+            read_state_indices=full(slots.read_state_indices),
         )
         ctx.kv_caches[idx] = (new_conv_state, ssm_state)
         return torch_view(out)

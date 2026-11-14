@@ -1457,6 +1457,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if has_kv_transfer_group():
             get_kv_transfer_group().register_runner(self)
 
+    @property
+    def mamba_state_max_reqs(self) -> int:
+        """Requests that can hold mamba state slots at once: the scheduler
+        never runs more than max_num_seqs per DP rank. max_num_reqs is padded
+        up to MIN_NUM_SEQS for batch shapes; sizing the mamba pool (and the
+        spec-decode scratch region) from it reserves state no request can
+        use, which at long context costs whole requests' worth of KV."""
+        return min(self.max_num_reqs,
+                   self.dp_size * self.scheduler_config.max_num_seqs)
+
     def _wire_input_batch_mamba_state(self,
                                       kv_cache_config: KVCacheConfig) -> None:
         self.input_batch.has_mamba_layers = kv_cache_config.has_mamba_layers
@@ -1472,7 +1482,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.input_batch.init_mamba_pools(
                 self.kv_cache_manager.actual_mamba_num_blocks,
                 scratch_slots_per_rank=gdn_spec_scratch_slots_per_rank(
-                    self.vllm_config, self.max_num_reqs, self.dp_size))
+                    self.vllm_config, self.mamba_state_max_reqs,
+                    self.dp_size))
 
     def delete_kv_cache(self) -> None:
         self.kv_cache_manager.delete_kv_cache()

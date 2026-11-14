@@ -402,6 +402,7 @@ def ple_short_conv(
     read_offsets: jax.Array | None = None,  # (max_reqs,) with spec decode
     num_spec: int = 0,
     num_windowed: jax.Array | None = None,  # requests [0, n) are windows
+    read_state_indices: jax.Array | None = None,  # (max_reqs,) read slots
 ):
     """Causal dilated depthwise conv with per-request state; returns
     (silu(conv), new_conv_state).
@@ -429,6 +430,10 @@ def ple_short_conv(
     computed = seq_lens - qlen  # tokens before this step
     has_init = computed > 0
     slots = state_indices.astype(jnp.int32)
+    # Align-mode prefix caching reads from another slot (the block holding
+    # the last computed token) than it writes; default: the same slot.
+    read_base = (slots if read_state_indices is None else
+                 read_state_indices.astype(jnp.int32))
 
     def read_state(slot_ids):
         flat = conv_state[slot_ids, row_offset:row_offset + rows_needed, :]
@@ -438,9 +443,9 @@ def ple_short_conv(
     windowed = jnp.zeros((max_reqs, ), bool)
     if num_spec > 0:
         windowed = jnp.arange(max_reqs) < num_windowed
-        read_slots = slots + jnp.where(windowed, read_offsets, 0)
+        read_slots = read_base + jnp.where(windowed, read_offsets, 0)
     else:
-        read_slots = slots
+        read_slots = read_base
     state = read_state(read_slots)  # (max_reqs, S, Cp)
     state = jnp.where(has_init[:, None, None], state, 0).astype(normed.dtype)
 

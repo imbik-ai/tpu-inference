@@ -113,7 +113,7 @@ class KVCacheManager:
         `gdn_spec_scratch_slots_per_rank` rows of every DP rank's shard for
         the runner's verify-window scratch groups."""
         scratch_per_rank = gdn_spec_scratch_slots_per_rank(
-            self.runner.vllm_config, self.runner.max_num_reqs,
+            self.runner.vllm_config, self.runner.mamba_state_max_reqs,
             self.runner.dp_size)
         return physical_num_blocks - scratch_per_rank * max(
             self.runner.dp_size, 1)
@@ -386,14 +386,9 @@ class KVCacheManager:
         def round_down(blocks: int) -> int:
             return (blocks // divisor) * divisor
 
-        # Requests that can hold mamba slots at once: the scheduler never
-        # runs more than max_num_seqs per DP rank. The runner's max_num_reqs
-        # is padded up to MIN_NUM_SEQS for its batch shapes, and sizing the
-        # pool from it would reserve state slots no request can use (at
-        # long context those slots cost whole requests' worth of KV).
-        max_num_reqs = min(
-            self.runner.max_num_reqs,
-            self.runner.dp_size * self.runner.scheduler_config.max_num_seqs)
+        # Requests that can hold mamba slots at once (see
+        # TPUModelRunner.mamba_state_max_reqs).
+        max_num_reqs = self.runner.mamba_state_max_reqs
         min_blocks_per_req, mamba_blocks_per_req = mamba_blocks_per_request(
             self.runner.vllm_config, is_align_mode)
         attn_blocks_per_req = max(
@@ -975,8 +970,9 @@ class KVCacheManager:
                 # in _maybe_set_compact_mamba_num_blocks_override.
                 _, mamba_slot_stride = mamba_blocks_per_request(
                     self.runner.vllm_config, is_align_mode=False)
-                mamba_num_blocks = mamba_pool_size(self.runner.max_num_reqs,
-                                                   mamba_slot_stride, divisor)
+                mamba_num_blocks = mamba_pool_size(
+                    self.runner.mamba_state_max_reqs, mamba_slot_stride,
+                    divisor)
                 logger.info(
                     "Compact-mamba sizing was not set; defaulting "
                     "mamba_num_blocks to %d (max_num_reqs=%d, "
