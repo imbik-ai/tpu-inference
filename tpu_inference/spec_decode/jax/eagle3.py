@@ -75,6 +75,10 @@ class Eagle3Proposer:
             "vllm_model.language_model.model.embed_tokens.weight",
             "vllm_model.model.embed_tokens.weight"
         ]
+        if self.method == "mtp":
+            # MTP heads predict with the target's LM head; share it rather
+            # than hold a second copy (only same-shape params are shared).
+            shared_names.append("vllm_model.lm_head.weight")
         shared_params = {
             k: v
             for k, v in self.runner.state.items() if k in shared_names

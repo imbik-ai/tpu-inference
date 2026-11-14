@@ -44,7 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchax.interop import jax_view, torch_view
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
@@ -160,7 +160,7 @@ class Qwen4ExpRMSNorm(nn.Module):
         out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
         if self.group_size is not None:
             out = out.flatten(-2)
-        return (out * (1.0 + self.weight.float())).type_as(x)
+        return (out * (1.0 + self.weight.float())).to(x.dtype)
 
 
 class Qwen4ExpGatedResidual(nn.Module):
@@ -318,6 +318,9 @@ class Qwen4ExpPLE(nn.Module):
                                 bias=False)
         self.dilation = config.ngram_size
         self.gdn_layer_name = gdn_layer_name
+        spec = get_current_vllm_config().speculative_config
+        self.num_spec = (spec.num_speculative_tokens
+                         if spec is not None else 0)
         self.gdn_conv_rows = config.linear_conv_kernel_dim - 1
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -360,6 +363,9 @@ class Qwen4ExpPLE(nn.Module):
             dilation=self.dilation,
             max_reqs=md.seq_lens.shape[0],
             padded_num_reqs=md.padded_num_reqs,
+            read_offsets=md.mamba.read_offsets,
+            num_spec=self.num_spec if md.mamba.read_offsets is not None else 0,
+            num_windowed=md.request_distribution[0],
         )
         ctx.kv_caches[idx] = (new_conv_state, ssm_state)
         return torch_view(out)
@@ -592,6 +598,9 @@ class Qwen4ExpModel(nn.Module):
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers")
         self.hyper_connection_mixer = Qwen4ExpGatedResidual(config,
                                                             use_combine=False)
+        spec = vllm_config.speculative_config
+        self.emit_mtp_hidden = (spec is not None
+                                and getattr(spec, "method", None) == "mtp")
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -607,6 +616,10 @@ class Qwen4ExpModel(nn.Module):
         _dump("final_in", hidden_states)
         mixed, _ = self.hyper_connection_mixer.mix(hidden_states)
         _dump("final_out", mixed)
+        if self.emit_mtp_hidden:
+            # [single stream for the LM head | pre-mixer multi stream for
+            # the MTP drafter]; compute_logits uses the first H columns.
+            return torch.cat([mixed, hidden_states], dim=-1)
         return mixed
 
     def load_weights(self, weights: Iterable[tuple[str,
@@ -655,6 +668,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE):
                           inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # With MTP the forward output also carries the multi stream.
+        hidden_states = hidden_states[..., :self.config.hidden_size]
         return self.logits_processor(self.lm_head, hidden_states)
 
     def get_mrope_input_positions(self, input_tokens, mm_features):
@@ -689,7 +704,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE):
                 vllm_config.parallel_config.tensor_parallel_size,
                 hf.linear_num_key_heads, hf.linear_num_value_heads,
                 hf.linear_key_head_dim, hf.linear_value_head_dim,
-                hf.linear_conv_kernel_dim, 0))
+                hf.linear_conv_kernel_dim,
+                (vllm_config.speculative_config.num_speculative_tokens
+                 if vllm_config.speculative_config else 0)))
         extra = ple_extra_conv_rows(hf)
         return (conv_shape[0] + extra, conv_shape[1]), ssm_shape
 
@@ -701,3 +718,119 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE):
 class Qwen4ExpForConditionalGeneration(Qwen4ExpForCausalLM):
     """Text-only stand-in for the HF vision-language architecture: vision
     tower weights are skipped."""
+
+
+class Qwen4ExpMTP(nn.Module):
+    """Qwen4Exp multi-token-prediction draft model (one QSA + MoE layer).
+
+    Input hidden states are [single | multi stream] rows from the target (or
+    the previous draft step); the output has the same layout. Math follows
+    vLLM's Qwen4ExpMultiTokenPredictor: normed token embedding and normed
+    multi stream are projected, the embedding is added to every stream, one
+    hyper-connected decoder layer runs, and the final mixer gives the LM-head
+    stream. The FP8 block-scaled MTP experts are dequantized to bf16 at load.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_text_config
+        self.config = config
+        H, C = config.hidden_size, config.hc_count
+        self.hidden_size, self.hc_count = H, C
+        self.mtp_start = config.num_hidden_layers
+        eps = config.rms_norm_eps
+        # Under `model.` so the drafter shares the target's embedding
+        # (vllm_model.model.embed_tokens.weight).
+        self.model = nn.Module()
+        self.model.embed_tokens = VocabParallelEmbedding(config.vocab_size, H)
+        self.fc_embedding = nn.Linear(H, H, bias=False)
+        self.fc_hidden = nn.Linear(H, H, bias=False)
+        self.pre_fc_norm_embedding = Qwen4ExpRMSNorm(H, eps)
+        self.pre_fc_norm_hidden = Qwen4ExpRMSNorm(H * C, eps)
+        self.layers = nn.ModuleList([
+            Qwen4ExpDecoderLayer(vllm_config, "full_attention",
+                                 f"mtp.layers.{self.mtp_start}")
+        ])
+        self.hyper_connection_mixer = Qwen4ExpGatedResidual(config,
+                                                            use_combine=False)
+        self.lm_head = ParallelLMHead(config.vocab_size,
+                                      H,
+                                      prefix=maybe_prefix(prefix, "lm_head"))
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
+    def forward(self,
+                input_ids: torch.Tensor,
+                positions: torch.Tensor,
+                hidden_states: torch.Tensor,
+                inputs_embeds: torch.Tensor | None = None,
+                spec_step_idx: int = 0,
+                **kwargs) -> torch.Tensor:
+        H, C = self.hidden_size, self.hc_count
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        emb = self.fc_embedding(self.pre_fc_norm_embedding(inputs_embeds))
+        multi = hidden_states[..., H:]
+        T = multi.shape[0]
+        h = self.fc_hidden(
+            self.pre_fc_norm_hidden(multi).view(T, C, H))  # (T, C, H)
+        x = (emb.unsqueeze(-2) + h).flatten(-2)
+        x = self.layers[0](x, positions)
+        mixed, _ = self.hyper_connection_mixer.mix(x)
+        return torch.cat([mixed, x], dim=-1)
+
+    def compute_logits(self,
+                       hidden_states: torch.Tensor,
+                       spec_step_idx: int = 0) -> torch.Tensor:
+        return self.logits_processor(self.lm_head,
+                                     hidden_states[..., :self.hidden_size])
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        """Checkpoint names: mtp.*, plus the target's embed_tokens and
+        lm_head."""
+        stacked = Qwen3_5Model.hf_to_vllm_mapper
+        pending: dict[str, dict] = {}
+
+        def remap():
+            for name, w in weights:
+                for pre in ("model.language_model.", "language_model."):
+                    if name.startswith(pre):
+                        name = "model." + name[len(pre):]
+                        break
+                if name in ("model.embed_tokens.weight", "lm_head.weight"):
+                    yield name, w
+                    continue
+                if not name.startswith("mtp."):
+                    continue
+                name = name[len("mtp."):]  # layers.0.* = self.layers[0]
+                # FP8 block-scaled experts -> bf16 (weight * scale_inv per
+                # 128x128 block).
+                if ".mlp.experts." in name and (name.endswith(".weight") or
+                                                name.endswith(
+                                                    ".weight_scale_inv")):
+                    key = name.rsplit(".", 1)[0]
+                    d = pending.setdefault(key, {})
+                    d[name.rsplit(".", 1)[1]] = w
+                    if len(d) == 2:
+                        wq, s = d["weight"], d["weight_scale_inv"]
+                        wf = wq.to(torch.float32)
+                        s = s.to(torch.float32).repeat_interleave(
+                            128, 0)[:wf.shape[0]].repeat_interleave(
+                                128, 1)[:, :wf.shape[1]]
+                        del pending[key]
+                        yield key + ".weight", (wf * s).to(torch.bfloat16)
+                    continue
+                yield name, w
+
+        loader = AutoWeightsLoader(
+            self,
+            ignore_unexpected_suffixes=["hyper_connection_mixer."
+                                        "block_inject_weight.weight"])
+        mapper = stacked | WeightsMapper(
+            orig_to_new_substr={
+                "hyper_connection_mixer.block_inject_weight": None
+            })
+        return loader.load_weights(remap(), mapper=mapper)

@@ -399,6 +399,9 @@ def ple_short_conv(
     dilation: int,
     max_reqs: int,
     padded_num_reqs: int,
+    read_offsets: jax.Array | None = None,  # (max_reqs,) with spec decode
+    num_spec: int = 0,
+    num_windowed: jax.Array | None = None,  # requests [0, n) are windows
 ):
     """Causal dilated depthwise conv with per-request state; returns
     (silu(conv), new_conv_state).
@@ -406,6 +409,12 @@ def ple_short_conv(
     The state (the last (K-1)*dilation inputs, oldest first) lives in rows
     [row_offset, row_offset + n_rows) of the same layer's GDN conv state
     slot, flattened over the conv_dim axis.
+
+    Speculative decoding follows the GDN slot convention: each request owns
+    num_spec + 1 consecutive slots from state_indices[r]; a verify window
+    (requests [0, num_windowed)) reads its state from slot
+    state_indices[r] + read_offsets[r] and writes the state after window
+    token t to slot state_indices[r] + t.
     """
     T, Cp = normed.shape
     K = conv_weight.shape[-1]
@@ -426,7 +435,13 @@ def ple_short_conv(
         flat = flat.reshape(slot_ids.shape[0], rows_needed * conv_dim)
         return flat[:, :S * Cp].reshape(slot_ids.shape[0], S, Cp)
 
-    state = read_state(slots)  # (max_reqs, S, Cp)
+    windowed = jnp.zeros((max_reqs, ), bool)
+    if num_spec > 0:
+        windowed = jnp.arange(max_reqs) < num_windowed
+        read_slots = slots + jnp.where(windowed, read_offsets, 0)
+    else:
+        read_slots = slots
+    state = read_state(read_slots)  # (max_reqs, S, Cp)
     state = jnp.where(has_init[:, None, None], state, 0).astype(normed.dtype)
 
     t = jnp.arange(T, dtype=jnp.int32)
@@ -447,22 +462,37 @@ def ple_short_conv(
     out = jax.nn.silu(conv.astype(jnp.float32)).astype(normed.dtype)
     out = jnp.where(valid[:, None], out, 0)
 
-    # New state: inputs at positions seq_len - S .. seq_len - 1.
     r = jnp.arange(padded_num_reqs, dtype=jnp.int32)
     jj = jnp.arange(S, dtype=jnp.int32)
-    pos = seq_lens[:padded_num_reqs, None] - S + jj[None, :]
     c0 = computed[:padded_num_reqs, None]
-    in_chunk = pos >= c0
-    tok = jnp.clip(qsl[:padded_num_reqs, None] + (pos - c0), 0, T - 1)
-    st_row = jnp.clip(S - (c0 - pos), 0, S - 1)
-    new_state = jnp.where(in_chunk[..., None], normed[tok],
-                          state[r[:, None], st_row])
-    new_state = jnp.where((pos >= 0)[..., None], new_state, 0)
-    flat = new_state.reshape(padded_num_reqs, S * Cp)
-    flat = jnp.pad(flat, ((0, 0), (0, rows_needed * conv_dim - S * Cp)))
-    flat = flat.reshape(padded_num_reqs, rows_needed,
-                        conv_dim).astype(conv_state.dtype)
-    write_slot = jnp.where(r < num_reqs, slots[:padded_num_reqs], n_slots)
-    new_conv_state = conv_state.at[write_slot, row_offset:row_offset +
-                                   rows_needed, :].set(flat, mode="drop")
+
+    def state_ending_at(end):  # (R,) exclusive end position -> (R, S, Cp)
+        pos = end[:, None] - S + jj[None, :]
+        in_chunk = pos >= c0
+        tok = jnp.clip(qsl[:padded_num_reqs, None] + (pos - c0), 0, T - 1)
+        st_row = jnp.clip(S - (c0 - pos), 0, S - 1)
+        st = jnp.where(in_chunk[..., None], normed[tok], state[r[:, None],
+                                                                st_row])
+        st = jnp.where((pos >= 0)[..., None], st, 0)
+        flat = st.reshape(padded_num_reqs, S * Cp)
+        flat = jnp.pad(flat, ((0, 0), (0, rows_needed * conv_dim - S * Cp)))
+        return flat.reshape(padded_num_reqs, rows_needed,
+                            conv_dim).astype(conv_state.dtype)
+
+    def write(cs, slot, rows):
+        return cs.at[slot, row_offset:row_offset + rows_needed, :].set(
+            rows, mode="drop")
+
+    live = r < num_reqs
+    base = slots[:padded_num_reqs]
+    win = windowed[:padded_num_reqs]
+    # Final state (positions seq_len - S .. seq_len - 1) for whole requests.
+    new_conv_state = write(conv_state, jnp.where(live & ~win, base, n_slots),
+                           state_ending_at(seq_lens[:padded_num_reqs]))
+    for t in range(num_spec + 1 if num_spec > 0 else 0):
+        # Verify windows: checkpoint after window token t at base + t.
+        ok = live & win & (t < qlen[:padded_num_reqs])
+        new_conv_state = write(new_conv_state,
+                               jnp.where(ok, base + t, n_slots),
+                               state_ending_at(c0[:, 0] + t + 1))
     return out, new_conv_state

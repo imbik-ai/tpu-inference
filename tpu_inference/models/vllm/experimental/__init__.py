@@ -25,6 +25,8 @@ _TPU_VLLM_MODELS = {
     "Qwen4ExpForConditionalGeneration":
     "tpu_inference.models.vllm.experimental.qwen4_exp:"
     "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpMTP":
+    "tpu_inference.models.vllm.experimental.qwen4_exp:Qwen4ExpMTP",
 }
 
 
