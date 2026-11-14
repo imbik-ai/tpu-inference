@@ -147,6 +147,41 @@ def _qsa_write_and_compress(q, k, v, idx_q, idx_k, kv_cache, positions, bt,
     return q, idx_q, kv_cache, (a_c, p_c)
 
 
+def topk_mask(scores: jax.Array, k: int) -> jax.Array:
+    """Membership mask of jax.lax.top_k(scores, k) per row, restricted to
+    entries > -inf (same set, including top_k's lower-index-first rule for
+    ties). scores (rows, n) float32, finite values >= 0 or -inf.
+
+    lax.top_k over the indexer's groups (k = 512 of up to max_model_len / 4)
+    was the largest single op of a long prefill; this finds each row's k-th
+    largest value by bisection on the float bits (31 vectorized
+    compare-and-count passes) and needs no sort or scatter.
+    """
+    n = scores.shape[-1]
+    if k >= n:
+        return scores > -jnp.inf
+    valid = scores > -jnp.inf
+    # Non-negative float32 values order like their int32 bit patterns.
+    keys = jnp.where(valid, jax.lax.bitcast_convert_type(
+        jnp.maximum(scores, 0.0), jnp.int32), -1)
+
+    def step(_, lohi):
+        lo, hi = lohi
+        mid = lo + (hi - lo) // 2
+        ok = (keys >= mid[:, None]).sum(-1) >= k
+        return jnp.where(ok, mid, lo), jnp.where(ok, hi, mid)
+
+    rows = scores.shape[:-1]
+    lo = jnp.zeros(rows, jnp.int32)
+    hi = jnp.full(rows, jnp.iinfo(jnp.int32).max, jnp.int32)
+    thr, _ = jax.lax.fori_loop(0, 31, step, (lo, hi))  # k-th largest key
+    above = keys > thr[:, None]
+    tie = keys == thr[:, None]
+    need = k - above.sum(-1, keepdims=True)
+    take = tie & (jnp.cumsum(tie, axis=-1) <= need)
+    return (above | take) & valid
+
+
 def _masked_softmax_attend(qg, keys, vals, mask, scale, dtype):
     """qg (T,Hkv,G,D); keys/vals (T or 1, S, Hkv, D); mask (T,S)."""
     logits = jnp.einsum("tkgd,tskd->tkgs",
@@ -230,8 +265,7 @@ def qsa_attention(
                             preferred_element_type=jnp.float32)
         scores = jnp.maximum(scores, 0.0).sum(axis=1) / math.sqrt(Di)
         scores = jnp.where(bv, scores, -jnp.inf)
-        vals, top_idx = jax.lax.top_k(scores, block_topk)
-        return top_idx, vals > -jnp.inf
+        return topk_mask(scores, block_topk)
 
     r_pad = padded_num_reqs
 
@@ -249,8 +283,11 @@ def qsa_attention(
         chunk = min(T, 64)
         pad = (-T) % chunk
 
-        def per_query(qg_c, req_c, pos_c, nb_c, top_idx, top_ok):
+        def per_query(qg_c, req_c, pos_c, nb_c, sel):
             """Each query gathers its own selected groups (no sharing)."""
+            top_idx, top_ok = jax.vmap(lambda m: (
+                jnp.nonzero(m, size=block_topk, fill_value=0)[0],
+                jnp.arange(block_topk) < m.sum()))(sel)
             groups = jnp.concatenate([top_idx, nb_c[:, None]], axis=1)
             counts = jnp.concatenate(
                 [jnp.where(top_ok, R, 0), (pos_c + 1 - nb_c * R)[:, None]],
@@ -275,20 +312,24 @@ def qsa_attention(
         max_union = min(chunk * (block_topk + 1), n_gid)
         caps = sorted({min(c, max_union) for c in union_caps if c > 0})
 
-        def shared(union_cap, qg_c, req_c, pos_c, nb_c, top_idx, top_ok,
-                   valid_c):
+        def request_bits(sel, req_c, valid_c):
+            """(c, NB) per-query masks -> (c, r_pad * NB) in union-id space
+            (request * NB + group); invalid queries select nothing."""
+            sel = sel & valid_c[:, None]
+            onehot = req_c[:, None] == jnp.arange(r_pad)[None, :]
+            return (onehot[:, :, None] & sel[:, None, :]).reshape(
+                sel.shape[0], n_gid)
+
+        def shared(union_cap, qg_c, req_c, pos_c, nb_c, sel, valid_c):
             """The chunk's queries share one gather of the union of their
             groups (selected + tails, at most `union_cap`); each query masks
             to its own."""
             c = qg_c.shape[0]
-            sel_gid = jnp.where(top_ok & valid_c[:, None],
-                                req_c[:, None] * NB + top_idx, n_gid)
             cnt = pos_c + 1 - nb_c * R
             tail_gid = jnp.where(valid_c & (cnt > 0), req_c * NB + nb_c,
                                  n_gid)
-            qbits = jnp.zeros((c, n_gid + 1), bool)
-            qbits = qbits.at[jnp.arange(c)[:, None], sel_gid].set(True)
-            ubits = qbits.any(axis=0).at[tail_gid].set(True)[:n_gid]
+            qbits = request_bits(sel, req_c, valid_c)  # (c, n_gid)
+            ubits = qbits.any(axis=0).at[tail_gid].set(True, mode="drop")
             uidx = jnp.nonzero(ubits, size=union_cap, fill_value=0)[0]
             u_ok = jnp.arange(union_cap) < ubits.sum()
             u_req, u_grp = uidx // NB, uidx % NB
@@ -312,21 +353,19 @@ def qsa_attention(
             req_c = jnp.minimum(req_c, r_pad - 1)
             nb_c = (pos_c + 1) // R
             bv = jnp.arange(NB, dtype=jnp.int32)[None, :] < nb_c[:, None]
-            top_idx, top_ok = select(iq_c, ck_all[req_c], bv)
+            sel = select(iq_c, ck_all[req_c], bv)  # (c, NB) top-k mask
             if not caps:
-                return per_query(qg_c, req_c, pos_c, nb_c, top_idx, top_ok)
+                return per_query(qg_c, req_c, pos_c, nb_c, sel)
             # Union size, computed the same way as in `shared`.
-            sel_gid = jnp.where(top_ok & valid_c[:, None],
-                                req_c[:, None] * NB + top_idx, n_gid)
-            bits = jnp.zeros((n_gid + 1, ), bool).at[sel_gid].set(True)
             cnt = pos_c + 1 - nb_c * R
+            bits = request_bits(sel, req_c, valid_c).any(axis=0)
             bits = bits.at[jnp.where(valid_c & (cnt > 0), req_c * NB + nb_c,
-                                     n_gid)].set(True)
-            n_union = bits[:n_gid].sum()
+                                     n_gid)].set(True, mode="drop")
+            n_union = bits.sum()
             # Smallest bucket that holds the union; past the last bucket,
             # per-query gathers.
             branch = (n_union > jnp.asarray(caps, jnp.int32)).sum()
-            args = (qg_c, req_c, pos_c, nb_c, top_idx, top_ok)
+            args = (qg_c, req_c, pos_c, nb_c, sel)
             branches = [
                 functools.partial(shared, cap, *args, valid_c) for cap in caps
             ]
@@ -371,10 +410,7 @@ def qsa_attention(
         hist = pages_buf[r].reshape(L, C, Dc)  # (L, C, Dc)
         k_r = hist[:, 0:2 * Hkv:2, :D]  # (L, Hkv, D)
         v_r = hist[:, 1:2 * Hkv:2, :D]
-        top_idx, top_ok = select(idx_q, ck_all[r][None], bvalid)
-        sel = jnp.zeros((T, NB), dtype=bool).at[jnp.arange(T)[:, None],
-                                                top_idx].set(top_ok)
-        sel = sel & bvalid
+        sel = select(idx_q, ck_all[r][None], bvalid) & bvalid
         mask = jnp.take_along_axis(
             sel, jnp.broadcast_to(blk_of_j[None, :], (T, L)), axis=1)
         mask = (mask & (j[None, :] < nb_t[:, None] * R)) | tail
