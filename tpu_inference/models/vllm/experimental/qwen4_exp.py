@@ -113,6 +113,12 @@ def _dump(name: str, t: torch.Tensor) -> None:
     jax.debug.callback(save, jax_view(t))
 
 
+# Union sizes (groups) a 64-query chunk may share in one gather; larger unions
+# use per-query gathers ("0": always per-query).
+_QSA_UNION_CAPS = tuple(
+    int(c) for c in os.environ.get("QWEN4EXP_QSA_UNION_CAPS",
+                                   "2048,8192").split(","))
+
 # HF configs name QSA layers "full_attention" (raw) or "indexed_attention".
 _QSA_LAYER_TYPES = ("full_attention", "indexed_attention",
                     "qwen_sparse_attention")
@@ -475,6 +481,7 @@ class Qwen4ExpQSAAttention(nn.Module):
             budget=self.budget,
             scale=self.scaling,
             sparse_max_tokens=_QSA_SPARSE_MAX_TOKENS,
+            union_caps=_QSA_UNION_CAPS,
             mesh=ctx.mesh,
             head_axis=ShardingAxisName.KV_HEAD,
             cache_spec=P(ShardingAxisName.BATCH, ShardingAxisName.KV_CONTEXT,

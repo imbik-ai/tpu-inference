@@ -184,7 +184,7 @@ def qsa_attention(
     budget: int,
     scale: float,
     sparse_max_tokens: int = 1 << 30,
-    union_cap: int = 2048,
+    union_caps: tuple = (2048, 8192),
     mesh=None,
     head_axis=None,
     cache_spec=None,
@@ -270,10 +270,16 @@ def qsa_attention(
                                           dtype).astype(q.dtype)
 
         n_gid = r_pad * NB  # union ids: request * NB + group
+        # A chunk's union holds at most chunk * (top-k + tail) groups, so a
+        # decode step (few queries) always fits one exact-size bucket.
+        max_union = min(chunk * (block_topk + 1), n_gid)
+        caps = sorted({min(c, max_union) for c in union_caps if c > 0})
 
-        def shared(qg_c, req_c, pos_c, nb_c, top_idx, top_ok, valid_c):
+        def shared(union_cap, qg_c, req_c, pos_c, nb_c, top_idx, top_ok,
+                   valid_c):
             """The chunk's queries share one gather of the union of their
-            groups (selected + tails); each query masks to its own."""
+            groups (selected + tails, at most `union_cap`); each query masks
+            to its own."""
             c = qg_c.shape[0]
             sel_gid = jnp.where(top_ok & valid_c[:, None],
                                 req_c[:, None] * NB + top_idx, n_gid)
@@ -307,7 +313,7 @@ def qsa_attention(
             nb_c = (pos_c + 1) // R
             bv = jnp.arange(NB, dtype=jnp.int32)[None, :] < nb_c[:, None]
             top_idx, top_ok = select(iq_c, ck_all[req_c], bv)
-            if union_cap <= 0:
+            if not caps:
                 return per_query(qg_c, req_c, pos_c, nb_c, top_idx, top_ok)
             # Union size, computed the same way as in `shared`.
             sel_gid = jnp.where(top_ok & valid_c[:, None],
@@ -317,11 +323,19 @@ def qsa_attention(
             bits = bits.at[jnp.where(valid_c & (cnt > 0), req_c * NB + nb_c,
                                      n_gid)].set(True)
             n_union = bits[:n_gid].sum()
-            return jax.lax.cond(
-                n_union <= union_cap,
-                lambda: shared(qg_c, req_c, pos_c, nb_c, top_idx, top_ok,
-                               valid_c),
-                lambda: per_query(qg_c, req_c, pos_c, nb_c, top_idx, top_ok))
+            # Smallest bucket that holds the union; past the last bucket,
+            # per-query gathers.
+            branch = (n_union > jnp.asarray(caps, jnp.int32)).sum()
+            args = (qg_c, req_c, pos_c, nb_c, top_idx, top_ok)
+            branches = [
+                functools.partial(shared, cap, *args, valid_c) for cap in caps
+            ]
+            if caps[-1] < max_union:
+                branches.append(functools.partial(per_query, *args))
+            if len(branches) == 1:
+                return branches[0]()
+            return jax.lax.switch(jnp.minimum(branch, len(branches) - 1),
+                                  branches)
 
         def chunks(x):
             x = jnp.pad(x, [(0, pad)] + [(0, 0)] * (x.ndim - 1))
