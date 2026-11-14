@@ -1,0 +1,134 @@
+# Patch for tokamax 0.0.18.dev20261107, file gmm_v2.py (the gmm_v2 grouped-matmul kernel).
+# v6e has no fp4 vectors. The patch carries fp4 (e2m1) expert weights as int4 bits and decodes them
+# to bf16 in VMEM. The NVFP4 MoE path for qwen4_exp needs it. Apply: patch <installed gmm_v2.py> < this file
+--- gmm_v2.orig.py	2026-11-13 13:07:29
++++ gmm_v2.py	2026-11-13 15:22:39
+@@ -185,6 +185,11 @@
+   def get_scale(self, replicate_size: int | None = None) -> jax.Array:
+     assert self.scale is not None
+     if replicate_size is not None:
++      if jax.dtypes.itemsize_bits(self.scale.dtype) < 32:
++        # Zero-stride loads are not supported for packed (16-bit) types:
++        # load the (blocks, 1, n) tile, widen, then broadcast in registers.
++        s = self.scale[...].astype(jnp.float32)
++        return jnp.broadcast_to(s, (s.shape[0], replicate_size, s.shape[2]))
+       # Perform zero-stride load for efficient broadcasting across sublanes.
+       return self.scale[:, pl.ds(0, replicate_size, 0), :]
+     return self.scale[...]
+@@ -279,6 +284,9 @@
+   # unquantized (dtype != quant_dtype) the scale quantizes it online (lhs).
+   has_scale: bool = False
+   is_transposed: bool = False
++  # fp4 (e2m1) weights carried as int4 bits on TPUs without native fp4
++  # vectors (v6e and older); decoded to the lhs dtype in VMEM.
++  e2m1_as_int4: bool = False
+ 
+   @property
+   def should_unpack(self) -> bool:
+@@ -306,6 +314,8 @@
+     """Dequantize rhs before matmul if block size limits MXU utilization."""
+     if not self.has_scale:
+       return False
++    if self.e2m1_as_int4:
++      return True
+     assert self.quant_block_size is not None
+     mxu_size = pltpu.get_tpu_info().mxu_column_size
+     return self.quant_block_size < mxu_size
+@@ -319,8 +329,30 @@
+     if self.quant_dtype is None:
+       return False
+     return self.quant_dtype != self.dtype
++
++
++def _decode_e2m1_bits(x_int4: jax.Array, dtype) -> jax.Array:
++  """e2m1 values from their bits held in an int4 vector (sign = bit 3)."""
++  x = x_int4.astype(jnp.float32)  # two's complement: -8..7
++  neg = x < 0
++  m = jnp.where(neg, x + 8.0, x)  # magnitude code 0..7
++  val = jnp.where(m < 4.0, m * 0.5, jnp.where(m < 6.0, m - 2.0, m * 2.0 - 8.0))
++  return jnp.where(neg, -val, val).astype(dtype)
+ 
+ 
++# Set by callers that store fp4 (e2m1) weights as int4 bits ahead of time
++# (one bitcast at load) so the per-call f4->int4 bitcast, which relayouts the
++# whole weight on TPU, is avoided. int4 rhs is then decoded as e2m1.
++INT4_RHS_IS_E2M1 = False
++
++
++def _needs_e2m1_emulation(rhs_dtype) -> bool:
++  if jnp.dtype(rhs_dtype) != jnp.dtype(jnp.float4_e2m1fn):
++    return False
++  gen = getattr(pltpu.get_tpu_info(), "generation", None)
++  return type(gen) is int and gen < 7
++
++
+ @dataclasses.dataclass(frozen=True)
+ class GmmConfigs:
+   tiles: TileSizes
+@@ -601,7 +633,11 @@
+           cfgs.lhs_cfgs.dtype
+       )
+       num_blocks = cfgs.num_quant_blocks_per_tile_k
+-      tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype).reshape(
++      if cfgs.rhs_cfgs.e2m1_as_int4:
++        tiled_rhs_dequant = _decode_e2m1_bits(tiled_rhs, cfgs.lhs_cfgs.dtype)
++      else:
++        tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype)
++      tiled_rhs_dequant = tiled_rhs_dequant.reshape(
+           num_blocks, rhs_qbs, rhs_tile_n
+       )
+       tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
+@@ -1549,6 +1585,7 @@
+     transpose_rhs: bool = False,
+     lhs_quant_dtype: jnp.dtype | None = None,
+     rhs_quant_dtype: jnp.dtype | None = None,
++    e2m1_as_int4: bool = False,
+ ):
+   """Fills the GMM config for the GMM kernel."""
+   packing_factor = get_packing_factor(rhs.dtype, rhs_quant_dtype)
+@@ -1586,6 +1623,7 @@
+       has_bias=rhs_bias is not None,
+       has_scale=has_scale,
+       is_transposed=transpose_rhs,
++      e2m1_as_int4=e2m1_as_int4,
+   )
+ 
+   lhs_q_dtype = None
+@@ -1784,6 +1822,17 @@
+ 
+   if vmem_limit_bytes is None:
+     vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
++
++  e2m1_emulated = _needs_e2m1_emulation(rhs.dtype)
++  if e2m1_emulated:
++    if rhs_scale is None:
++      raise NotImplementedError("fp4 rhs without scales")
++    rhs = lax.bitcast_convert_type(rhs, jnp.int4)
++    if rhs_quant_dtype is not None:
++      rhs_quant_dtype = jnp.int4
++  elif (INT4_RHS_IS_E2M1 and jnp.dtype(rhs.dtype) == jnp.dtype(jnp.int4)
++        and rhs_scale is not None):
++    e2m1_emulated = True
+ 
+   cfgs = make_gmm_configs(
+       lhs,
+@@ -1804,6 +1853,7 @@
+       transpose_rhs=transpose_rhs,
+       lhs_quant_dtype=lhs_quant_dtype,
+       rhs_quant_dtype=rhs_quant_dtype,
++      e2m1_as_int4=e2m1_emulated,
+   )
+   dims = cfgs.dims
+   tiles = cfgs.tiles
+@@ -1815,7 +1865,10 @@
+   else:
+     lhs_scale = None
+ 
+-  if rhs_scale is not None:
++  if rhs_scale is not None and not (
++      e2m1_emulated and jnp.dtype(rhs_scale.dtype) == jnp.dtype(jnp.bfloat16)):
++    # e2m1 weights with bf16 scales: the kernel widens each scale tile in
++    # VMEM (get_scale), so no whole-array upcast per call.
+     rhs_scale = rhs_scale.astype(jnp.float32)
+   if rhs_bias is not None:
+     rhs_bias = rhs_bias.astype(jnp.float32)
