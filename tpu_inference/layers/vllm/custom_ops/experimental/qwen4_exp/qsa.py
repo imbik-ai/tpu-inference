@@ -39,9 +39,11 @@ a Pallas kernel is the follow-up.
 
 import functools
 import math
+import os
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 from tpu_inference.layers.vllm.custom_ops.experimental.qwen4_exp.paged_gather import \
     paged_gather
@@ -182,6 +184,49 @@ def topk_mask(scores: jax.Array, k: int) -> jax.Array:
     return (above | take) & valid
 
 
+_QSA_HEAD_LOCAL = os.environ.get("QWEN4EXP_QSA_HEAD_LOCAL", "1") == "1"
+
+
+def _head_local_attend(kv_cache, qg, mask, pages, offs, *, length, D, scale,
+                       dtype, mesh, head_axis, cache_spec):
+    """Union-path attention with one cache head slot per device.
+
+    qg (c, Hkv, G, D) replicated; mask (c, S) with S = len(pages) * length.
+    Device h gathers the runs of its own head slot and, when h < Hkv,
+    attends with KV head h; other devices (index / spare slots) return
+    zeros. Returns (c, Hkv, G, D).
+    """
+    c, Hkv, G, _ = qg.shape
+
+    def local(cache_l, qg_r, mask_r, pages_r, offs_r):
+        h = jax.lax.axis_index(head_axis)
+        kv = paged_gather(cache_l, pages_r, offs_r, length=length)
+        kv = kv[:, :, 0]  # (U, R, P, Dc): this device's head slot
+        keys = kv[..., 0, :D].reshape(-1, D)
+        vals = kv[..., 1, :D].reshape(-1, D)
+        q_h = jax.lax.dynamic_index_in_dim(qg_r, jnp.minimum(h, Hkv - 1),
+                                           axis=1, keepdims=False)
+        logits = jnp.einsum("tgd,sd->tgs", q_h, keys,
+                            preferred_element_type=jnp.float32) * scale
+        logits = jnp.where(mask_r[:, None, :], logits, -jnp.inf)
+        logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+        probs = jnp.exp(logits)
+        probs = probs / jnp.sum(probs, axis=-1, keepdims=True)
+        out = jnp.einsum("tgs,sd->tgd", probs.astype(dtype), vals,
+                         preferred_element_type=jnp.float32)
+        out = jnp.where(h < Hkv, out, 0.0)
+        return out[:, None]  # (c, 1, G, D)
+
+    out = jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(cache_spec or P(None, None, head_axis), P(), P(), P(), P()),
+        out_specs=P(None, head_axis),
+        check_vma=False,
+    )(kv_cache, qg, mask, pages.astype(jnp.int32), offs.astype(jnp.int32))
+    return out[:, :Hkv]
+
+
 def _masked_softmax_attend(qg, keys, vals, mask, scale, dtype):
     """qg (T,Hkv,G,D); keys/vals (T or 1, S, Hkv, D); mask (T,S)."""
     logits = jnp.einsum("tkgd,tskd->tkgs",
@@ -307,6 +352,12 @@ def qsa_attention(
                                           dtype).astype(q.dtype)
 
         n_gid = r_pad * NB  # union ids: request * NB + group
+        # Under TP the cache's head slots are spread one per device; then each
+        # device attends with the KV head it holds (shard_map), so the
+        # gathered keys never cross devices (only q and the output do).
+        head_local = (_QSA_HEAD_LOCAL and mesh is not None
+                      and head_axis is not None
+                      and mesh.shape[head_axis] == A and A >= Hkv)
         # A chunk's union holds at most chunk * (top-k + tail) groups, so a
         # decode step (few queries) always fits one exact-size bucket.
         max_union = min(chunk * (block_topk + 1), n_gid)
@@ -340,6 +391,14 @@ def qsa_attention(
                 cnt[:, None, None]))  # (c, U, R)
             utok = u_grp * R
             upage = bt[u_req, jnp.clip(utok // bs, 0, pages_per_req - 1)]
+            mask = ok.reshape(c, union_cap * R)
+            if head_local:
+                return _head_local_attend(kv_cache, qg_c, mask, upage,
+                                          utok % bs, length=R, D=D,
+                                          scale=scale, dtype=dtype, mesh=mesh,
+                                          head_axis=head_axis,
+                                          cache_spec=cache_spec).astype(
+                                              q.dtype)
             kv = gather(kv_cache, upage, utok % bs, length=R)
             kv = kv[:, :, :Hkv]  # (U, R, Hkv, P, Dc)
             keys = kv[..., 0, :D].reshape(1, union_cap * R, Hkv, D)
